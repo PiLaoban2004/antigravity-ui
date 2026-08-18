@@ -1,0 +1,87 @@
+{
+  "plan": "Google AI Pro",
+  "email": "pilaoban2004@gmail.com",
+  "promptCredits": {
+    "available": 500,
+    "monthly": 50000,
+    "remainingPercentage": 1
+  },
+  "summary": {
+    "gemini": {
+      "title": "Gemini Models",
+      "weeklyLimitRemaining": 89,
+      "weeklyResetEn": "17 hours, 2 minutes",
+      "weeklyResetZh": "17 小时 2 分钟",
+      "fiveHourLimitRemaining": 79,
+      "fiveHourResetEn": "2 hours, 52 minutes",
+      "fiveHourResetZh": "2 小时 52 分钟"
+    },
+    "claude_gpt": {
+      "title": "Claude and GPT models",
+      "weeklyLimitRemaining": 42,
+      "weeklyResetEn": "17 hours, 25 minutes",
+      "weeklyResetZh": "17 小时 25 分钟",
+      "fiveHourLimitRemaining": 100,
+      "fiveHourResetEn": "fully refreshed",
+      "fiveHourResetZh": "已完全刷新"
+    }
+  },
+  "models": [
+    {
+      "label": "Gemini 3.7 Flash (High)",
+      "modelId": "gemini-3.7-flash-high",
+      "group": "gemini",
+      "remainingPercentage": 79,
+      "timeRemainingEn": "2 hours, 52 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.6 Flash (High)",
+      "modelId": "gemini-3.6-flash-high",
+      "group": "gemini",
+      "remainingPercentage": 79,
+      "timeRemainingEn": "2 hours, 52 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.5 Flash (High)",
+      "modelId": "gemini-3.5-flash-high",
+      "group": "gemini",
+      "remainingPercentage": 79,
+      "timeRemainingEn": "2 hours, 52 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.1 Pro (Low)",
+      "modelId": "gemini-3.1-pro-low",
+      "group": "gemini",
+      "remainingPercentage": 79,
+      "timeRemainingEn": "2 hours, 52 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Claude Sonnet 4.6 (Thinking)",
+      "modelId": "claude-sonnet-4-6",
+      "group": "claude_gpt",
+      "remainingPercentage": 100,
+      "timeRemainingEn": "fully refreshed",
+      "isExhausted": false
+    },
+    {
+      "label": "Claude Opus 4.6 (Thinking)",
+      "modelId": "claude-opus-4-6",
+      "group": "claude_gpt",
+      "remainingPercentage": 100,
+      "timeRemainingEn": "fully refreshed",
+      "isExhausted": false
+    },
+    {
+      "label": "GPT-OSS 120B (Medium)",
+      "modelId": "gpt-oss-120b",
+      "group": "claude_gpt",
+      "remainingPercentage": 100,
+      "timeRemainingEn": "fully refreshed",
+      "isExhausted": false
+    }
+  ]
+}

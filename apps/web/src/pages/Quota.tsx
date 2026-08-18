@@ -193,7 +193,14 @@ export default function Quota() {
 
       {/* Plan Section */}
       <div className="mb-6">
-        <div className="text-sm font-semibold text-zinc-200 mb-2">Plan</div>
+        <div className="text-sm font-semibold text-zinc-200 mb-2 flex items-center justify-between">
+          <span>Plan</span>
+          {data?.isCached && (
+            <span className="text-[11px] text-zinc-400 font-normal">
+              配额已自动同步缓存
+            </span>
+          )}
+        </div>
         <div className="p-4 rounded-xl bg-[#141416] border border-[#232326] flex items-center justify-between">
           <div>
             <div className="text-[15px] font-semibold text-white flex items-center gap-2">

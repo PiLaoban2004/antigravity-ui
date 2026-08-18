@@ -187,8 +187,26 @@ app.get('/api/usage/summary', (c) => {
   return c.json(s ?? {});
 });
 
-// ---- Antigravity Native Quota Detection ----
+// ---- Antigravity Native Quota Detection & Caching ----
 let cachedLsPort: { port: number; csrf: string; isHttps: boolean } | null = null;
+const QUOTA_CACHE_FILE = 'quota_cache.json';
+
+function saveQuotaCache(data: any) {
+  try {
+    const toSave = { ...data, cachedAt: new Date().toISOString() };
+    Bun.write(QUOTA_CACHE_FILE, JSON.stringify(toSave, null, 2));
+  } catch {}
+}
+
+async function loadQuotaCache(): Promise<any | null> {
+  try {
+    const file = Bun.file(QUOTA_CACHE_FILE);
+    if (await file.exists()) {
+      return await file.json();
+    }
+  } catch {}
+  return null;
+}
 
 async function detectLanguageServer(): Promise<{ port: number; csrf: string; isHttps: boolean } | null> {
   // 1. Try cached port first for speed
@@ -395,7 +413,7 @@ app.get('/api/quota', async (c) => {
     const availableCredits = planStatus.availablePromptCredits;
     const monthlyCredits = planStatus.planInfo?.monthlyPromptCredits;
 
-    return c.json({
+    const result = {
       online: true,
       source: 'local_ide',
       selectedAccount: targetEmail,
@@ -438,7 +456,10 @@ app.get('/api/quota', async (c) => {
         },
       },
       models: parsedModels,
-    });
+    };
+
+    saveQuotaCache(result);
+    return c.json(result);
   }
 
   // 5. Account is remote/offline from local IDE or in non-active state
@@ -465,6 +486,27 @@ app.get('/api/quota', async (c) => {
   }
   if (!validationUrl && isNeedsVerify) {
     validationUrl = 'https://developers.google.com/gemini-code-assist';
+  }
+
+  // If this is the active main account (e.g. pilaoban) but local Language Server is closed, load from cache!
+  if (!isDisabled && !isNeedsVerify && (targetEmail === 'pilaoban2004@gmail.com' || targetEmail === localEmail)) {
+    const cached = await loadQuotaCache();
+    if (cached) {
+      return c.json({
+        ...cached,
+        isCached: true,
+        online: true,
+        source: 'cached_offline',
+        selectedAccount: targetEmail,
+        accounts: accounts.map((a) => ({
+          email: a.email,
+          auth_index: a.auth_index,
+          status: a.status,
+          disabled: a.disabled,
+          isCurrentIde: a.email === localEmail,
+        })),
+      });
+    }
   }
 
   const accountStatusLabel = isDisabled
