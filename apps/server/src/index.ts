@@ -441,34 +441,79 @@ app.get('/api/quota', async (c) => {
     });
   }
 
-  // 5. Account is remote/offline from local IDE or error state
-  const isError = activeAccount?.status === 'error' && Boolean(activeAccount?.status_message);
-  let validationUrl = '';
+  // 5. Account is remote/offline from local IDE or in non-active state
+  const isDisabled = Boolean(activeAccount?.disabled);
+  const statusMsg = activeAccount?.status_message || '';
+  const isNeedsVerify =
+    activeAccount?.status === 'error' ||
+    (typeof statusMsg === 'string' && statusMsg.includes('Verify your account')) ||
+    (typeof statusMsg === 'object' && JSON.stringify(statusMsg).includes('Verify your account'));
 
-  if (activeAccount?.status_message) {
+  let validationUrl = '';
+  if (statusMsg) {
     try {
-      const parsedMsg = typeof activeAccount.status_message === 'string' ? JSON.parse(activeAccount.status_message) : activeAccount.status_message;
+      const parsedMsg = typeof statusMsg === 'string' ? JSON.parse(statusMsg) : statusMsg;
       const details = parsedMsg?.error?.details ?? [];
       for (const d of details) {
         if (d.metadata?.validation_url) validationUrl = d.metadata.validation_url;
+        const links = d.links ?? [];
+        for (const l of links) {
+          if (l.url && l.url.includes('google.com')) validationUrl = l.url;
+        }
       }
     } catch {}
   }
+  if (!validationUrl && isNeedsVerify) {
+    validationUrl = 'https://developers.google.com/gemini-code-assist';
+  }
 
-  // Standard model list template for accounts
+  const accountStatusLabel = isDisabled
+    ? '已在反代路由中禁用'
+    : isNeedsVerify
+    ? '需在 Google 完成账号验证'
+    : '云端备用账号 (正常待命)';
+
+  const accountPlanName = isDisabled
+    ? 'Google AI (已禁用)'
+    : isNeedsVerify
+    ? 'Google AI (需要完成验证)'
+    : 'Google AI Pro (云端)';
+
+  const accountPlanDesc = isDisabled
+    ? '该账号当前已被手动设为禁用状态。如需恢复该账号的模型请求分流，请在「路由策略」页面开启。'
+    : isNeedsVerify
+    ? '该 Google 账号尚未完成 Google Gemini Code Assist 首次安全验证，Google 暂时拦截了调用。'
+    : '该账号已授权接入反代池，处于云端就绪待命状态。';
+
+  const resetTextEn = isDisabled
+    ? 'Account disabled in routing pool'
+    : isNeedsVerify
+    ? 'Needs verification on Google'
+    : 'Fully available (100%)';
+
+  const resetTextZh = isDisabled
+    ? '账号已在路由池中禁用'
+    : isNeedsVerify
+    ? '需要在 Google 页面完成验证'
+    : '配额充足 (100%)';
+
+  const geminiRemaining = isDisabled ? 0 : isNeedsVerify ? 0 : 100;
+  const claudeRemaining = isDisabled ? 0 : isNeedsVerify ? 0 : 100;
+
   const standardModels = [
-    { label: 'Gemini 3.7 Flash (High)', modelId: 'gemini-3.7-flash-high', group: 'gemini', remainingPercentage: isError ? 0 : 79, timeRemainingEn: isError ? 'Unverified' : '2 hours, 52 minutes', isExhausted: isError },
-    { label: 'Gemini 3.6 Flash (High)', modelId: 'gemini-3.6-flash-high', group: 'gemini', remainingPercentage: isError ? 0 : 79, timeRemainingEn: isError ? 'Unverified' : '2 hours, 52 minutes', isExhausted: isError },
-    { label: 'Gemini 3.5 Flash (High)', modelId: 'gemini-3.5-flash-high', group: 'gemini', remainingPercentage: isError ? 0 : 79, timeRemainingEn: isError ? 'Unverified' : '2 hours, 52 minutes', isExhausted: isError },
-    { label: 'Gemini 3.1 Pro (Low)', modelId: 'gemini-3.1-pro-low', group: 'gemini', remainingPercentage: isError ? 0 : 79, timeRemainingEn: isError ? 'Unverified' : '2 hours, 52 minutes', isExhausted: isError },
-    { label: 'Claude Sonnet 4.6 (Thinking)', modelId: 'claude-sonnet-4-6', group: 'claude_gpt', remainingPercentage: isError ? 0 : 100, timeRemainingEn: isError ? 'Unverified' : 'fully refreshed', isExhausted: isError },
-    { label: 'Claude Opus 4.6 (Thinking)', modelId: 'claude-opus-4-6', group: 'claude_gpt', remainingPercentage: isError ? 0 : 100, timeRemainingEn: isError ? 'Unverified' : 'fully refreshed', isExhausted: isError },
-    { label: 'GPT-OSS 120B (Medium)', modelId: 'gpt-oss-120b', group: 'claude_gpt', remainingPercentage: isError ? 0 : 100, timeRemainingEn: isError ? 'Unverified' : 'fully refreshed', isExhausted: isError },
+    { label: 'Gemini 3.7 Flash (High)', modelId: 'gemini-3.7-flash-high', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
+    { label: 'Gemini 3.6 Flash (High)', modelId: 'gemini-3.6-flash-high', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
+    { label: 'Gemini 3.5 Flash (High)', modelId: 'gemini-3.5-flash-high', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
+    { label: 'Gemini 3.1 Pro (Low)', modelId: 'gemini-3.1-pro-low', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
+    { label: 'Claude Sonnet 4.6 (Thinking)', modelId: 'claude-sonnet-4-6', group: 'claude_gpt', remainingPercentage: claudeRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
+    { label: 'Claude Opus 4.6 (Thinking)', modelId: 'claude-opus-4-6', group: 'claude_gpt', remainingPercentage: claudeRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
+    { label: 'GPT-OSS 120B (Medium)', modelId: 'gpt-oss-120b', group: 'claude_gpt', remainingPercentage: claudeRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
   ];
 
   return c.json({
-    online: !isError,
-    source: 'cloud_account',
+    online: !isDisabled && !isNeedsVerify,
+    source: 'remote_account',
+    accountState: isDisabled ? 'disabled' : isNeedsVerify ? 'error' : 'active',
     selectedAccount: targetEmail,
     accounts: accounts.map((a) => ({
       email: a.email,
@@ -477,31 +522,29 @@ app.get('/api/quota', async (c) => {
       disabled: a.disabled,
       isCurrentIde: a.email === localEmail,
     })),
-    plan: isError ? 'Google AI (需要完成验证)' : 'Google AI Pro',
-    planDescription: isError
-      ? '该 Google 账号尚未在 Google 完成 Gemini Code Assist 首次安全验证，Google 暂时拦截了调用。'
-      : 'You can upgrade to a Google AI Ultra plan to receive higher rate limits.',
+    plan: accountPlanName,
+    planDescription: accountPlanDesc,
     email: targetEmail,
     validationUrl,
-    promptCredits: { available: 500, monthly: 50000, remainingPercentage: 1 },
+    promptCredits: isDisabled || isNeedsVerify ? { available: 0, monthly: 50000, remainingPercentage: 0 } : { available: 500, monthly: 50000, remainingPercentage: 1 },
     summary: {
       gemini: {
         title: 'Gemini Models',
-        fiveHourLimitRemaining: isError ? 0 : 79,
-        fiveHourResetEn: isError ? 'Needs verification' : '2 hours, 52 minutes',
-        fiveHourResetZh: isError ? '需完成验证' : '2 小时 52 分钟',
-        weeklyLimitRemaining: isError ? 0 : 89,
-        weeklyResetEn: isError ? 'Needs verification' : '17 hours, 2 minutes',
-        weeklyResetZh: isError ? '需完成验证' : '17 小时 2 分钟',
+        fiveHourLimitRemaining: geminiRemaining,
+        fiveHourResetEn: resetTextEn,
+        fiveHourResetZh: resetTextZh,
+        weeklyLimitRemaining: geminiRemaining,
+        weeklyResetEn: resetTextEn,
+        weeklyResetZh: resetTextZh,
       },
       claude_gpt: {
         title: 'Claude and GPT models',
-        fiveHourLimitRemaining: isError ? 0 : 100,
-        fiveHourResetEn: isError ? 'Needs verification' : 'fully refreshed',
-        fiveHourResetZh: isError ? '需完成验证' : '已完全刷新',
-        weeklyLimitRemaining: isError ? 0 : 42,
-        weeklyResetEn: isError ? 'Needs verification' : '17 hours, 25 minutes',
-        weeklyResetZh: isError ? '需完成验证' : '17 小时 25 分钟',
+        fiveHourLimitRemaining: claudeRemaining,
+        fiveHourResetEn: resetTextEn,
+        fiveHourResetZh: resetTextZh,
+        weeklyLimitRemaining: claudeRemaining,
+        weeklyResetEn: resetTextEn,
+        weeklyResetZh: resetTextZh,
       },
     },
     models: standardModels,
