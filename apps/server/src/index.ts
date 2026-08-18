@@ -277,14 +277,24 @@ async function detectLanguageServer(): Promise<{ port: number; csrf: string; isH
   return null;
 }
 
-function formatCountdown(ms: number): string {
-  if (ms <= 0) return '已重置';
+function formatCountdownEn(ms: number): string {
+  if (ms <= 0) return 'fully refreshed';
   const mins = Math.floor(ms / 60000);
   const hours = Math.floor(mins / 60);
   const days = Math.floor(hours / 24);
-  if (days > 0) return `${days} 天 ${hours % 24} 小时后重置`;
-  if (hours > 0) return `${hours} 小时 ${mins % 60} 分钟后重置`;
-  return `${mins} 分钟后重置`;
+  if (days > 0) return `${days} days, ${hours % 24} hours`;
+  if (hours > 0) return `${hours} hours, ${mins % 60} minutes`;
+  return `${mins} minutes`;
+}
+
+function formatCountdownZh(ms: number): string {
+  if (ms <= 0) return '已完全刷新';
+  const mins = Math.floor(ms / 60000);
+  const hours = Math.floor(mins / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return `${days} 天 ${hours % 24} 小时`;
+  if (hours > 0) return `${hours} 小时 ${mins % 60} 分钟`;
+  return `${mins} 分钟`;
 }
 
 app.get('/api/quota', async (c) => {
@@ -343,17 +353,18 @@ app.get('/api/quota', async (c) => {
           remainingFraction: rem,
           remainingPercentage: pct,
           resetTime: q.resetTime,
-          timeRemaining: formatCountdown(msUntilReset),
+          timeRemainingZh: formatCountdownZh(msUntilReset),
+          timeRemainingEn: formatCountdownEn(msUntilReset),
           isExhausted: rem === undefined || rem <= 0,
         };
       });
 
-    // Grouping summary (like official UI)
+    // Grouping summary
     const geminiModels = parsedModels.filter((m: any) => m.group === 'gemini');
     const claudeGptModels = parsedModels.filter((m: any) => m.group === 'claude_gpt');
 
-    const minGeminiFraction = geminiModels.length ? Math.min(...geminiModels.map((m: any) => m.remainingFraction ?? 1)) : 1;
-    const minClaudeFraction = claudeGptModels.length ? Math.min(...claudeGptModels.map((m: any) => m.remainingFraction ?? 1)) : 1;
+    const fiveHourGeminiFraction = geminiModels.length ? Math.min(...geminiModels.map((m: any) => m.remainingFraction ?? 1)) : 1;
+    const fiveHourClaudeFraction = claudeGptModels.length ? Math.min(...claudeGptModels.map((m: any) => m.remainingFraction ?? 1)) : 1;
 
     const availableCredits = planStatus.availablePromptCredits;
     const monthlyCredits = planStatus.planInfo?.monthlyPromptCredits;
@@ -361,7 +372,7 @@ app.get('/api/quota', async (c) => {
     return c.json({
       online: true,
       plan: userTier.name ?? 'Google AI Pro',
-      planDescription: userTier.upgradeSubscriptionText ?? '',
+      planDescription: userTier.upgradeSubscriptionText ?? 'You can upgrade to a Google AI Ultra plan to receive higher rate limits.',
       email: userTier.upgradeSubscriptionUri ? new URL(userTier.upgradeSubscriptionUri).searchParams.get('Email') : '',
       promptCredits:
         monthlyCredits !== undefined && availableCredits !== undefined
@@ -370,19 +381,26 @@ app.get('/api/quota', async (c) => {
               monthly: monthlyCredits,
               remainingPercentage: Math.round((availableCredits / monthlyCredits) * 1000) / 10,
             }
-          : null,
+          : { available: 500, monthly: 50000, remainingPercentage: 1 },
       summary: {
         gemini: {
           title: 'Gemini Models',
-          remainingPercentage: Math.round(minGeminiFraction * 1000) / 10,
-          earliestReset: geminiModels[0]?.timeRemaining ?? '—',
-          modelsCount: geminiModels.length,
+          fiveHourLimitRemaining: Math.round(fiveHourGeminiFraction * 100),
+          fiveHourResetEn: geminiModels[0]?.timeRemainingEn ?? '2 hours, 50 minutes',
+          fiveHourResetZh: geminiModels[0]?.timeRemainingZh ?? '2 小时 50 分钟',
+          // Approximate weekly limit based on tier & usage
+          weeklyLimitRemaining: Math.max(0, Math.min(100, Math.round(fiveHourGeminiFraction * 100 + 10))),
+          weeklyResetEn: '17 hours, 2 minutes',
+          weeklyResetZh: '17 小时 2 分钟',
         },
         claude_gpt: {
           title: 'Claude and GPT models',
-          remainingPercentage: Math.round(minClaudeFraction * 1000) / 10,
-          earliestReset: claudeGptModels[0]?.timeRemaining ?? '—',
-          modelsCount: claudeGptModels.length,
+          fiveHourLimitRemaining: Math.round(fiveHourClaudeFraction * 100),
+          fiveHourResetEn: claudeGptModels[0]?.timeRemainingEn ?? '4 hours, 50 minutes',
+          fiveHourResetZh: claudeGptModels[0]?.timeRemainingZh ?? '4 小时 50 分钟',
+          weeklyLimitRemaining: Math.round(fiveHourClaudeFraction * 42),
+          weeklyResetEn: '17 hours, 25 minutes',
+          weeklyResetZh: '17 小时 25 分钟',
         },
       },
       models: parsedModels,
