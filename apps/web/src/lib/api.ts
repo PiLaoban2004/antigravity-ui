@@ -78,4 +78,5 @@ export const api = {
   usageRecent: () => req<any[]>('/usage/recent'),
   usageSummary: () => req<any>('/usage/summary'),
   usageCost: () => req<{ total: number; per_model: any[] }>('/usage/cost'),
+  getQuota: () => req<any>('/quota'),
 };

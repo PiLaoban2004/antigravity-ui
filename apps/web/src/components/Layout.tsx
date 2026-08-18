@@ -11,6 +11,7 @@ import {
   Activity,
   Gauge,
   ChartColumn,
+  CircleGauge,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import type { HealthStatus } from '@antigravity-ui/shared';
@@ -22,6 +23,7 @@ const nav = [
   { to: '/routing', label: '路由策略', icon: GitBranch },
   { to: '/clients', label: '客户端配置', icon: Terminal },
   { to: '/availability', label: '可用性测试', icon: Gauge },
+  { to: '/quota', label: '额度监控', icon: CircleGauge },
   { to: '/usage', label: '模型用量', icon: ChartColumn },
   { to: '/logs', label: '日志', icon: ScrollText },
   { to: '/settings', label: '设置', icon: Settings },
