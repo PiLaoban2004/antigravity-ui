@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+bun.lockb
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# SQLite databases & logs
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.log
+logs/
+
+# Build outputs
+dist/
+build/
+.vite/
+.turbo/
+
+# OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
