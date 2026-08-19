@@ -260,7 +260,10 @@ async function detectLanguageServer(): Promise<{ port: number; csrf: string; isH
   }
 
   // Also include standard Antigravity port range
-  for (let p = 51030; p <= 51060; p++) {
+  for (let p = 51000; p <= 51080; p++) {
+    if (!candidatePorts.includes(p)) candidatePorts.push(p);
+  }
+  for (let p = 61000; p <= 61080; p++) {
     if (!candidatePorts.includes(p)) candidatePorts.push(p);
   }
 
