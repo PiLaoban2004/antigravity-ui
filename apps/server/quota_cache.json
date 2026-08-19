@@ -29,110 +29,132 @@
   "summary": {
     "gemini": {
       "title": "Gemini Models",
-      "fiveHourLimitRemaining": 94,
-      "fiveHourResetEn": "4 hours, 37 minutes",
-      "fiveHourResetZh": "4 小时 37 分钟",
-      "weeklyLimitRemaining": 89,
-      "weeklyResetEn": "17 hours, 2 minutes",
-      "weeklyResetZh": "17 小时 2 分钟"
+      "fiveHourLimitRemaining": 83,
+      "fiveHourResetEn": "4 hours, 19 minutes",
+      "fiveHourResetZh": "4 小时 19 分钟",
+      "weeklyLimitRemaining": 98,
+      "weeklyResetEn": "6 days, 23 hours",
+      "weeklyResetZh": "6 天 23 小时"
     },
     "claude_gpt": {
       "title": "Claude and GPT models",
       "fiveHourLimitRemaining": 100,
-      "fiveHourResetEn": "4 hours, 56 minutes",
-      "fiveHourResetZh": "4 小时 56 分钟",
-      "weeklyLimitRemaining": 42,
-      "weeklyResetEn": "17 hours, 25 minutes",
-      "weeklyResetZh": "17 小时 25 分钟"
+      "fiveHourResetEn": "4 hours, 55 minutes",
+      "fiveHourResetZh": "4 小时 55 分钟",
+      "weeklyLimitRemaining": 100,
+      "weeklyResetEn": "fully refreshed",
+      "weeklyResetZh": "已完全刷新"
     }
   },
   "models": [
     {
-      "label": "Gemini 3.5 Flash (Low)",
-      "modelId": "MODEL_PLACEHOLDER_M187",
-      "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
-      "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
-      "isExhausted": false
-    },
-    {
-      "label": "Gemini 3.1 Pro (High)",
-      "modelId": "MODEL_PLACEHOLDER_M16",
-      "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
-      "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
-      "isExhausted": false
-    },
-    {
-      "label": "Gemini 3.1 Pro (Low)",
-      "modelId": "MODEL_PLACEHOLDER_M36",
-      "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
-      "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
-      "isExhausted": false
-    },
-    {
-      "label": "Claude Opus 4.6 (Thinking)",
-      "modelId": "MODEL_PLACEHOLDER_M26",
-      "group": "claude_gpt",
-      "remainingFraction": 1,
-      "remainingPercentage": 100,
-      "resetTime": "2026-08-19T06:54:15Z",
-      "timeRemainingZh": "4 小时 56 分钟",
-      "timeRemainingEn": "4 hours, 56 minutes",
-      "isExhausted": false
-    },
-    {
       "label": "Gemini 3.7 Flash (Medium)",
       "modelId": "MODEL_PLACEHOLDER_M299",
       "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
       "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
       "isExhausted": false
     },
     {
       "label": "Gemini 3.6 Flash (High)",
       "modelId": "MODEL_PLACEHOLDER_M71",
       "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
       "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.6 Flash (Medium)",
+      "modelId": "MODEL_PLACEHOLDER_M72",
+      "group": "gemini",
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
+      "resetTime": "2026-08-19T06:35:39Z",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
       "isExhausted": false
     },
     {
       "label": "Gemini 3.5 Flash (High)",
       "modelId": "MODEL_PLACEHOLDER_M84",
       "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
       "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
       "isExhausted": false
     },
     {
       "label": "Gemini 3.5 Flash (Medium)",
       "modelId": "MODEL_PLACEHOLDER_M20",
       "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
       "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.5 Flash (Low)",
+      "modelId": "MODEL_PLACEHOLDER_M187",
+      "group": "gemini",
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
+      "resetTime": "2026-08-19T06:35:39Z",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.7 Flash (Low)",
+      "modelId": "MODEL_PLACEHOLDER_M300",
+      "group": "gemini",
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
+      "resetTime": "2026-08-19T06:35:39Z",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.6 Flash (Low)",
+      "modelId": "MODEL_PLACEHOLDER_M73",
+      "group": "gemini",
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
+      "resetTime": "2026-08-19T06:35:39Z",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.1 Pro (High)",
+      "modelId": "MODEL_PLACEHOLDER_M16",
+      "group": "gemini",
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
+      "resetTime": "2026-08-19T06:35:39Z",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Gemini 3.1 Pro (Low)",
+      "modelId": "MODEL_PLACEHOLDER_M36",
+      "group": "gemini",
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
+      "resetTime": "2026-08-19T06:35:39Z",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
       "isExhausted": false
     },
     {
@@ -141,9 +163,20 @@
       "group": "claude_gpt",
       "remainingFraction": 1,
       "remainingPercentage": 100,
-      "resetTime": "2026-08-19T06:54:15Z",
-      "timeRemainingZh": "4 小时 56 分钟",
-      "timeRemainingEn": "4 hours, 56 minutes",
+      "resetTime": "2026-08-19T07:11:17Z",
+      "timeRemainingZh": "4 小时 55 分钟",
+      "timeRemainingEn": "4 hours, 55 minutes",
+      "isExhausted": false
+    },
+    {
+      "label": "Claude Opus 4.6 (Thinking)",
+      "modelId": "MODEL_PLACEHOLDER_M26",
+      "group": "claude_gpt",
+      "remainingFraction": 1,
+      "remainingPercentage": 100,
+      "resetTime": "2026-08-19T07:11:17Z",
+      "timeRemainingZh": "4 小时 55 分钟",
+      "timeRemainingEn": "4 hours, 55 minutes",
       "isExhausted": false
     },
     {
@@ -152,55 +185,22 @@
       "group": "claude_gpt",
       "remainingFraction": 1,
       "remainingPercentage": 100,
-      "resetTime": "2026-08-19T06:54:15Z",
-      "timeRemainingZh": "4 小时 56 分钟",
-      "timeRemainingEn": "4 hours, 56 minutes",
+      "resetTime": "2026-08-19T07:11:17Z",
+      "timeRemainingZh": "4 小时 55 分钟",
+      "timeRemainingEn": "4 hours, 55 minutes",
       "isExhausted": false
     },
     {
       "label": "Gemini 3.7 Flash (High)",
       "modelId": "MODEL_PLACEHOLDER_M298",
       "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
+      "remainingFraction": 0.8324004,
+      "remainingPercentage": 83.2,
       "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
-      "isExhausted": false
-    },
-    {
-      "label": "Gemini 3.7 Flash (Low)",
-      "modelId": "MODEL_PLACEHOLDER_M300",
-      "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
-      "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
-      "isExhausted": false
-    },
-    {
-      "label": "Gemini 3.6 Flash (Medium)",
-      "modelId": "MODEL_PLACEHOLDER_M72",
-      "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
-      "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
-      "isExhausted": false
-    },
-    {
-      "label": "Gemini 3.6 Flash (Low)",
-      "modelId": "MODEL_PLACEHOLDER_M73",
-      "group": "gemini",
-      "remainingFraction": 0.9356551,
-      "remainingPercentage": 93.6,
-      "resetTime": "2026-08-19T06:35:39Z",
-      "timeRemainingZh": "4 小时 37 分钟",
-      "timeRemainingEn": "4 hours, 37 minutes",
+      "timeRemainingZh": "4 小时 19 分钟",
+      "timeRemainingEn": "4 hours, 19 minutes",
       "isExhausted": false
     }
   ],
-  "cachedAt": "2026-08-19T01:57:47.267Z"
+  "cachedAt": "2026-08-19T02:15:56.509Z"
 }

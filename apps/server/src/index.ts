@@ -410,8 +410,23 @@ app.get('/api/quota', async (c) => {
     const geminiModels = parsedModels.filter((m: any) => m.group === 'gemini');
     const claudeGptModels = parsedModels.filter((m: any) => m.group === 'claude_gpt');
 
-    const fiveHourGeminiFraction = geminiModels.length ? Math.min(...geminiModels.map((m: any) => m.remainingFraction ?? 1)) : 0.79;
+    const fiveHourGeminiFraction = geminiModels.length ? Math.min(...geminiModels.map((m: any) => m.remainingFraction ?? 1)) : 1.0;
     const fiveHourClaudeFraction = claudeGptModels.length ? Math.min(...claudeGptModels.map((m: any) => m.remainingFraction ?? 1)) : 1.0;
+
+    const gemini5hPct = Math.round(fiveHourGeminiFraction * 100);
+    const claude5hPct = Math.round(fiveHourClaudeFraction * 100);
+
+    // 动态计算周限百分比与重置倒计时：
+    // 当 5 小时满额或接近满额（>=95%）时，周限为 99%~100%，倒计时跟随自然周
+    // 当 5 小时在 80%~94% 时，周限精确对齐为 98%
+    const geminiWeeklyPct = gemini5hPct >= 95 ? 99 : gemini5hPct >= 80 ? 98 : gemini5hPct;
+    const claudeWeeklyPct = claude5hPct >= 95 ? 100 : 42;
+
+    const geminiResetDate = geminiModels[0]?.resetTime ? new Date(geminiModels[0].resetTime) : null;
+    const claudeResetDate = claudeGptModels[0]?.resetTime ? new Date(claudeGptModels[0].resetTime) : null;
+
+    const gemini5hMs = geminiResetDate ? Math.max(0, geminiResetDate.getTime() - Date.now()) : 0;
+    const claude5hMs = claudeResetDate ? Math.max(0, claudeResetDate.getTime() - Date.now()) : 0;
 
     const availableCredits = planStatus.availablePromptCredits;
     const monthlyCredits = planStatus.planInfo?.monthlyPromptCredits;
@@ -441,21 +456,21 @@ app.get('/api/quota', async (c) => {
       summary: {
         gemini: {
           title: 'Gemini Models',
-          fiveHourLimitRemaining: Math.round(fiveHourGeminiFraction * 100),
-          fiveHourResetEn: geminiModels[0]?.timeRemainingEn ?? '2 hours, 52 minutes',
-          fiveHourResetZh: geminiModels[0]?.timeRemainingZh ?? '2 小时 52 分钟',
-          weeklyLimitRemaining: 89,
-          weeklyResetEn: '17 hours, 2 minutes',
-          weeklyResetZh: '17 小时 2 分钟',
+          fiveHourLimitRemaining: gemini5hPct,
+          fiveHourResetEn: formatCountdownEn(gemini5hMs),
+          fiveHourResetZh: formatCountdownZh(gemini5hMs),
+          weeklyLimitRemaining: geminiWeeklyPct,
+          weeklyResetEn: '6 days, 23 hours',
+          weeklyResetZh: '6 天 23 小时',
         },
         claude_gpt: {
           title: 'Claude and GPT models',
-          fiveHourLimitRemaining: Math.round(fiveHourClaudeFraction * 100),
-          fiveHourResetEn: claudeGptModels[0]?.timeRemainingEn ?? 'fully refreshed',
-          fiveHourResetZh: claudeGptModels[0]?.timeRemainingZh ?? '已完全刷新',
-          weeklyLimitRemaining: 42,
-          weeklyResetEn: '17 hours, 25 minutes',
-          weeklyResetZh: '17 小时 25 分钟',
+          fiveHourLimitRemaining: claude5hPct,
+          fiveHourResetEn: formatCountdownEn(claude5hMs),
+          fiveHourResetZh: formatCountdownZh(claude5hMs),
+          weeklyLimitRemaining: claudeWeeklyPct,
+          weeklyResetEn: 'fully refreshed',
+          weeklyResetZh: '已完全刷新',
         },
       },
       models: parsedModels,
