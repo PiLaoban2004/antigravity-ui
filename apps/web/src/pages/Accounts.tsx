@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Plus, RefreshCw, Power, Trash2, Copy, ExternalLink, Loader2, RotateCcw } from 'lucide-react';
 import { api } from '../lib/api';
+import { useAuthFiles } from '../lib/useAuthFiles';
+import { useSession } from '../lib/session';
 import type { AuthFile } from '@antigravity-ui/shared';
 
 export default function Accounts() {
+  const { remote } = useSession();
+  // Remote sessions never start an OAuth sign-in: a login from a new device/IP is what gets accounts reviewed.
+  const canOAuth = !remote || ['127.0.0.1', 'localhost', '[::1]'].includes(window.location.hostname);
   const [files, setFiles] = useState<AuthFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
@@ -30,19 +35,11 @@ export default function Accounts() {
     load();
   }, [load]);
 
-  // SSE live refresh of account list
+  // Live refresh of the account list over the app-wide shared SSE connection
+  const live = useAuthFiles();
   useEffect(() => {
-    const es = new EventSource('http://127.0.0.1:4310/api/events');
-    es.addEventListener('auth-files', (ev) => {
-      try {
-        const data = JSON.parse((ev as MessageEvent).data);
-        if (Array.isArray(data.files)) setFiles(data.files);
-      } catch {
-        /* ignore */
-      }
-    });
-    return () => es.close();
-  }, []);
+    if (live.connected) setFiles(live.files);
+  }, [live.files, live.connected]);
 
   const startAuth = async () => {
     try {
@@ -116,17 +113,23 @@ export default function Accounts() {
   };
 
   return (
-    <div className="p-8">
-      <div className="flex items-center justify-between mb-6">
+    <div className="p-4 sm:p-6 md:p-8">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
         <div>
           <h1 className="text-2xl font-semibold">账号管理</h1>
           <p className="text-zinc-400 text-sm mt-1">添加、启用/禁用、切换 Antigravity 账号</p>
         </div>
         <div className="flex gap-2">
-          <button onClick={load} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm">
+          <button onClick={load} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm whitespace-nowrap">
             <RefreshCw className="w-4 h-4" /> 刷新
           </button>
-          <button onClick={startAuth} className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">
+          <button
+            data-write
+            onClick={startAuth}
+            disabled={!canOAuth}
+            title={canOAuth ? undefined : '为避免新设备/新 IP 登录触发账号风控，OAuth 只能在运行看板的这台机器上进行'}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
+          >
             <Plus className="w-4 h-4" /> 添加账号
           </button>
         </div>
@@ -155,7 +158,7 @@ export default function Accounts() {
 
       <div className="grid gap-3">
         {files.length === 0 && !loading && (
-          <div className="text-zinc-500 text-sm p-8 text-center border border-dashed border-zinc-800 rounded-xl">还没有账号，点击右上角「添加账号」</div>
+          <div className="text-zinc-500 text-sm p-4 sm:p-6 md:p-8 text-center border border-dashed border-zinc-800 rounded-xl">还没有账号，点击右上角「添加账号」</div>
         )}
         {files.map((f) => (
           <div key={f.id} className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
@@ -172,18 +175,19 @@ export default function Accounts() {
             </div>
             <div className="flex items-center gap-2">
               {f.status === 'error' && !f.disabled && (
-                <button onClick={resetQuota} title="重置配额/状态" className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700">
+                <button data-write onClick={resetQuota} title="重置配额/状态" className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700">
                   <RotateCcw className="w-4 h-4" />
                 </button>
               )}
               <button
+                data-write
                 onClick={() => toggle(f)}
                 title={f.disabled ? '启用' : '禁用'}
                 className={`p-2 rounded-lg ${f.disabled ? 'bg-emerald-900 text-emerald-300 hover:bg-emerald-800' : 'bg-zinc-800 hover:bg-zinc-700'}`}
               >
                 <Power className="w-4 h-4" />
               </button>
-              <button onClick={() => remove(f)} title="删除账号" className="p-2 rounded-lg bg-zinc-800 hover:bg-red-900 hover:text-red-300">
+              <button data-write onClick={() => remove(f)} title="删除账号" className="p-2 rounded-lg bg-zinc-800 hover:bg-red-900 hover:text-red-300">
                 <Trash2 className="w-4 h-4" />
               </button>
             </div>

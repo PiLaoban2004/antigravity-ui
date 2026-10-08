@@ -1,11 +1,12 @@
 import { useEffect, useState, useCallback } from 'react';
 import { RefreshCw, AlertCircle, Info, ChevronDown, ChevronUp, Clock, CheckCircle2, XCircle, User, ExternalLink, ShieldAlert, Power } from 'lucide-react';
 import { api } from '../lib/api';
+import { pollWhileVisible } from '../lib/poll';
 
-function CircleProgress({ percentage, size = 44, strokeWidth = 4, color = '#22c55e', label }: { percentage: number; size?: number; strokeWidth?: number; color?: string; label?: string }) {
+function CircleProgress({ percentage, size = 44, strokeWidth = 4, color = '#22c55e', label }: { percentage: number | null; size?: number; strokeWidth?: number; color?: string; label?: string }) {
   const radius = (size - strokeWidth) / 2;
   const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (percentage / 100) * circumference;
+  const strokeDashoffset = circumference - ((percentage ?? 0) / 100) * circumference;
 
   return (
     <div className="relative flex items-center justify-center shrink-0" style={{ width: size, height: size }}>
@@ -22,7 +23,7 @@ function CircleProgress({ percentage, size = 44, strokeWidth = 4, color = '#22c5
           cx={size / 2}
           cy={size / 2}
           r={radius}
-          stroke={percentage === 0 ? '#3f3f46' : color}
+          stroke={percentage === 0 || percentage === null ? '#3f3f46' : color}
           strokeWidth={strokeWidth}
           strokeDasharray={circumference}
           strokeDashoffset={strokeDashoffset}
@@ -32,10 +33,19 @@ function CircleProgress({ percentage, size = 44, strokeWidth = 4, color = '#22c5
         />
       </svg>
       <span className="absolute text-[11px] font-medium text-zinc-200">
-        {label || (percentage === 0 ? '0%' : `${percentage}%`)}
+        {label || (percentage === null ? '--' : `${percentage}%`)}
       </span>
     </div>
   );
+}
+
+function agoZh(iso?: string): string {
+  const t = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(t)) return '';
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return `${mins} 分钟前`;
+  return `${Math.floor(mins / 60)} 小时 ${mins % 60} 分钟前`;
 }
 
 export default function Quota() {
@@ -65,8 +75,7 @@ export default function Quota() {
 
   useEffect(() => {
     load(selectedEmail);
-    const t = setInterval(() => load(selectedEmail), 30000);
-    return () => clearInterval(t);
+    return pollWhileVisible(() => load(selectedEmail), 30000);
   }, [load, selectedEmail]);
 
   const handleSwitchAccount = (email: string) => {
@@ -79,11 +88,17 @@ export default function Quota() {
   const claude = data?.summary?.claude_gpt;
   const accounts: any[] = data?.accounts ?? [];
 
+  // `null` from the server means "unknown", which is deliberately not rendered as 100%.
+  const unknownNote = data?.isCached
+    ? '缓存中的该额度窗口已重置，数值已过期。在 Antigravity IDE 中登录该账号并打开本页可获取最新额度。'
+    : '该账号不是本机 Antigravity IDE 当前登录的账号，无法读取真实额度。';
+
   const isCurrentDisabled = data?.accountState === 'disabled';
   const isCurrentError = data?.accountState === 'error';
+  const isCurrentCooldown = data?.accountState === 'cooldown' || Boolean(data?.cooldowns && data.cooldowns.length > 0);
 
   return (
-    <div className="p-10 max-w-4xl font-sans text-zinc-100">
+    <div className="p-4 sm:p-6 md:p-10 max-w-4xl font-sans text-zinc-100">
       {/* Top Header */}
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-2">
@@ -111,6 +126,7 @@ export default function Quota() {
               const isSelected = (selectedEmail || data?.selectedAccount) === a.email;
               const isErr = a.status === 'error';
               const isDis = a.disabled;
+              const hasCooldown = a.cooldowns && a.cooldowns.length > 0;
 
               return (
                 <button
@@ -124,13 +140,24 @@ export default function Quota() {
                 >
                   <span
                     className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                      isDis ? 'bg-zinc-600' : isErr ? 'bg-red-500' : 'bg-emerald-400'
+                      isDis
+                        ? 'bg-zinc-600'
+                        : isErr
+                        ? 'bg-red-500'
+                        : hasCooldown
+                        ? 'bg-amber-400'
+                        : 'bg-emerald-400'
                     }`}
                   />
                   <span className="font-mono">{a.email}</span>
                   {a.isCurrentIde && (
                     <span className="text-[10px] px-1.5 py-0.2 rounded bg-sky-950 text-sky-400 border border-sky-800/40">
                       IDE
+                    </span>
+                  )}
+                  {hasCooldown && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-950 text-amber-400 border border-amber-800/40">
+                      429 冷却
                     </span>
                   )}
                   {isDis && (
@@ -154,6 +181,19 @@ export default function Quota() {
         <div className="mb-6 p-4 rounded-xl bg-red-950/60 border border-red-900 text-red-300 text-sm flex items-center gap-2">
           <AlertCircle className="w-4 h-4 shrink-0" />
           <span>{err}</span>
+        </div>
+      )}
+
+      {/* Account Cooldown Notice Banner */}
+      {isCurrentCooldown && (
+        <div className="mb-6 p-4 rounded-xl bg-amber-950/40 border border-amber-800/80 text-amber-200 text-sm flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 text-amber-400" />
+          <div>
+            <div className="font-semibold text-amber-300">该账号上游已触发 Google 429 配额用尽（冷却中）</div>
+            <div className="text-xs text-amber-200/80 mt-1">
+              CLIProxyAPI 反代网关已捕获 Google 429 限流保护信号，预计剩余冷却时间：{data?.cooldownZh || gemini?.fiveHourResetZh || '数小时'}。网关在此期间已执行保护性熔断，倒计时结束后将自动恢复该账号请求分流。
+            </div>
+          </div>
         </div>
       )}
 
@@ -197,23 +237,21 @@ export default function Quota() {
           <span>Plan</span>
           {data?.isCached && (
             <span className="text-[11px] text-zinc-400 font-normal">
-              配额已自动同步缓存
+              缓存数据 · 记录于 {agoZh(data.cachedAt)}
             </span>
           )}
         </div>
-        <div className="p-4 rounded-xl bg-[#141416] border border-[#232326] flex items-center justify-between">
-          <div>
-            <div className="text-[15px] font-semibold text-white flex items-center gap-2">
-              <span>Your Plan: {data?.plan || 'Google AI Pro'}</span>
-              <span className="text-xs font-normal text-zinc-400 font-mono">({data?.selectedAccount || data?.email})</span>
+        <div className="p-4 rounded-xl bg-[#141416] border border-[#232326] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-[15px] font-semibold text-white flex flex-wrap items-center gap-x-2 gap-y-0.5">
+              <span>Your Plan: {data?.plan || '套餐未知'}</span>
+              <span className="text-xs font-normal text-zinc-400 font-mono break-all">({data?.selectedAccount || data?.email})</span>
             </div>
-            <div className="text-xs text-zinc-400 mt-0.5">
-              {data?.planDescription || 'You can upgrade to a Google AI Ultra plan to receive higher rate limits.'}
-            </div>
+            {data?.planDescription && <div className="text-xs text-zinc-400 mt-0.5">{data.planDescription}</div>}
           </div>
           <button
             onClick={() => window.open('https://antigravity.google/g1-upgrade', '_blank')}
-            className="px-4 py-1.5 rounded-lg bg-[#0070f3] hover:bg-[#0060df] text-xs font-semibold text-white transition-colors"
+            className="shrink-0 self-start sm:self-auto px-4 py-1.5 rounded-lg bg-[#0070f3] hover:bg-[#0060df] text-xs font-semibold text-white transition-colors"
           >
             Upgrade
           </button>
@@ -262,13 +300,17 @@ export default function Quota() {
                 {isCurrentDisabled
                   ? '账号已在反代路由中禁用'
                   : isCurrentError
-                  ? '账号尚未完成验证'
-                  : `You have used some of your weekly limit, it will fully refresh in ${gemini?.weeklyResetEn || '17 hours, 2 minutes'}.`}
+                  ? '账号状态异常 / 尚未完成验证'
+                  : isCurrentCooldown
+                  ? `上游 429 冷却中，预计恢复时间：${data?.cooldownZh || gemini?.weeklyResetZh || '2 小时'}`
+                  : gemini?.weeklyLimitRemaining == null
+                  ? unknownNote
+                  : `You have used some of your weekly limit, it will fully refresh in ${gemini?.weeklyResetEn || 'fully refreshed'}.`}
               </div>
             </div>
             <CircleProgress
-              percentage={gemini?.weeklyLimitRemaining ?? (isCurrentDisabled ? 0 : 89)}
-              color={isCurrentDisabled || isCurrentError ? '#52525b' : '#22c55e'}
+              percentage={gemini?.weeklyLimitRemaining ?? (isCurrentDisabled || isCurrentError || isCurrentCooldown ? 0 : null)}
+              color={isCurrentDisabled || isCurrentError ? '#52525b' : isCurrentCooldown ? '#f59e0b' : '#22c55e'}
             />
           </div>
           {/* Five Hour Limit */}
@@ -279,13 +321,17 @@ export default function Quota() {
                 {isCurrentDisabled
                   ? '账号已在反代路由中禁用'
                   : isCurrentError
-                  ? '账号尚未完成验证'
-                  : `You have used some of your 5-hour limit, it will fully refresh in ${gemini?.fiveHourResetEn || '2 hours, 52 minutes'}.`}
+                  ? '账号状态异常 / 尚未完成验证'
+                  : isCurrentCooldown
+                  ? `5小时配额用尽，冷却重置倒计时：${data?.cooldownZh || gemini?.fiveHourResetZh || '2 小时'}`
+                  : gemini?.fiveHourLimitRemaining == null
+                  ? unknownNote
+                  : `You have used some of your 5-hour limit, it will fully refresh in ${gemini?.fiveHourResetEn || 'fully refreshed'}.`}
               </div>
             </div>
             <CircleProgress
-              percentage={gemini?.fiveHourLimitRemaining ?? (isCurrentDisabled ? 0 : 79)}
-              color={isCurrentDisabled || isCurrentError ? '#52525b' : '#22c55e'}
+              percentage={gemini?.fiveHourLimitRemaining ?? (isCurrentDisabled || isCurrentError || isCurrentCooldown ? 0 : null)}
+              color={isCurrentDisabled || isCurrentError ? '#52525b' : isCurrentCooldown ? '#f59e0b' : '#22c55e'}
             />
           </div>
         </div>
@@ -306,12 +352,14 @@ export default function Quota() {
                 {isCurrentDisabled
                   ? '账号已在反代路由中禁用'
                   : isCurrentError
-                  ? '账号尚未完成验证'
-                  : `You have used some of your weekly limit, it will fully refresh in ${claude?.weeklyResetEn || '17 hours, 25 minutes'}.`}
+                  ? '账号状态异常 / 尚未完成验证'
+                  : claude?.weeklyLimitRemaining == null
+                  ? unknownNote
+                  : `You have used some of your weekly limit, it will fully refresh in ${claude?.weeklyResetEn || 'fully refreshed'}.`}
               </div>
             </div>
             <CircleProgress
-              percentage={claude?.weeklyLimitRemaining ?? (isCurrentDisabled ? 0 : 42)}
+              percentage={claude?.weeklyLimitRemaining ?? (isCurrentDisabled || isCurrentError ? 0 : null)}
               color={isCurrentDisabled || isCurrentError ? '#52525b' : '#16a34a'}
             />
           </div>
@@ -323,12 +371,14 @@ export default function Quota() {
                 {isCurrentDisabled
                   ? '账号已在反代路由中禁用'
                   : isCurrentError
-                  ? '账号尚未完成验证'
+                  ? '账号状态异常 / 尚未完成验证'
+                  : claude?.fiveHourLimitRemaining == null
+                  ? unknownNote
                   : `You have used some of your 5-hour limit, it will fully refresh in ${claude?.fiveHourResetEn || 'fully refreshed'}.`}
               </div>
             </div>
             <CircleProgress
-              percentage={claude?.fiveHourLimitRemaining ?? (isCurrentDisabled ? 0 : 100)}
+              percentage={claude?.fiveHourLimitRemaining ?? (isCurrentDisabled || isCurrentError ? 0 : null)}
               color={isCurrentDisabled || isCurrentError ? '#52525b' : '#22c55e'}
             />
           </div>
@@ -369,8 +419,8 @@ export default function Quota() {
               ))}
             </div>
 
-            <div className="rounded-xl border border-[#232326] bg-[#141416] overflow-hidden">
-              <table className="w-full text-sm">
+            <div className="rounded-xl border border-[#232326] bg-[#141416] overflow-x-auto">
+              <table className="w-full min-w-[560px] text-sm">
                 <thead>
                   <tr className="text-left text-zinc-400 border-b border-[#232326] text-xs">
                     <th className="px-4 py-3 font-medium">模型名称</th>
@@ -389,8 +439,8 @@ export default function Quota() {
                     </tr>
                   )}
                   {models.map((m: any, idx: number) => {
-                    const pct = m.remainingPercentage ?? 100;
-                    const barColor = isCurrentDisabled ? 'bg-zinc-700' : pct > 50 ? 'bg-emerald-500' : pct > 20 ? 'bg-amber-500' : 'bg-red-500';
+                    const pct: number | null = m.remainingPercentage ?? null;
+                    const barColor = isCurrentDisabled || pct === null ? 'bg-zinc-700' : pct > 50 ? 'bg-emerald-500' : pct > 20 ? 'bg-amber-500' : 'bg-red-500';
 
                     return (
                       <tr key={`${m.modelId}-${idx}`} className="hover:bg-zinc-900/40 transition-colors">
@@ -412,10 +462,10 @@ export default function Quota() {
                         <td className="px-4 py-2.5">
                           <div className="flex items-center gap-2">
                             <div className="w-20 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-                              <div className={`h-full ${barColor} rounded-full transition-all`} style={{ width: `${pct}%` }} />
+                              <div className={`h-full ${barColor} rounded-full transition-all`} style={{ width: `${pct ?? 0}%` }} />
                             </div>
                             <span className="font-mono text-xs text-zinc-300">
-                              {isCurrentDisabled ? '--' : `${pct}%`}
+                              {isCurrentDisabled || pct === null ? '--' : `${pct}%`}
                             </span>
                           </div>
                         </td>

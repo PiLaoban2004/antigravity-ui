@@ -40,7 +40,7 @@ export default function Routing() {
   };
 
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-6 md:p-8">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-semibold">路由策略</h1>
@@ -58,6 +58,7 @@ export default function Routing() {
         {STRATEGIES.map(({ id, label, desc }) => (
           <button
             key={id}
+            data-write
             onClick={() => saveStrategy(id)}
             className={`text-left p-4 rounded-xl border transition-colors ${
               strategy === id ? 'border-emerald-600 bg-emerald-950/40' : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700'
@@ -75,15 +76,16 @@ export default function Routing() {
       <h2 className="text-lg font-medium mb-3">账号启用状态与权重</h2>
       <div className="grid gap-2">
         {files.map((f) => (
-          <div key={f.id} className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 flex items-center justify-between gap-4">
+          <div key={f.id} className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
             <div className="flex items-center gap-3 min-w-0">
               <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${f.disabled ? 'bg-zinc-500' : 'bg-emerald-400'}`} />
               <span className="font-medium truncate">{f.email || f.account}</span>
             </div>
-            <div className="flex items-center gap-3 shrink-0">
+            <div className="flex items-center justify-between sm:justify-start gap-3 sm:shrink-0">
               <label className="flex items-center gap-2 text-xs text-zinc-400" title="加权轮询时的权重">
                 权重
                 <input
+                  data-write
                   type="number"
                   min={1}
                   max={1000000}
@@ -103,6 +105,7 @@ export default function Routing() {
                 />
               </label>
               <button
+                data-write
                 onClick={async () => {
                   await api.setAuthDisabled(f.name, !f.disabled);
                   await load();

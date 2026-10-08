@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api } from '../lib/api';
+import { pollWhileVisible } from '../lib/poll';
 
 export default function Logs() {
   const [logs, setLogs] = useState<string>('');
@@ -27,12 +28,11 @@ export default function Logs() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
+    return pollWhileVisible(load, 5000);
   }, []);
 
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-6 md:p-8">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-semibold">日志</h1>
