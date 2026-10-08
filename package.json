@@ -10,6 +10,7 @@
     "dev:server": "bun run --filter @antigravity-ui/server dev",
     "dev:web": "bun run --filter @antigravity-ui/web dev",
     "build": "bun run --filter '*' build",
-    "typecheck": "bun run --filter '*' typecheck"
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun run --filter @antigravity-ui/server test"
   }
 }

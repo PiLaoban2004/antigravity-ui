@@ -1,31 +1,44 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { streamSSE } from 'hono/streaming';
-import { Database } from 'bun:sqlite';
+import { AGENTROUTER_MODELS, inferGroup, isProviderGroup, isWorkBuddyModel } from './groups';
+import { fetchLiveSnapshots } from './language-server';
+import { priceFor } from './pricing';
+import { insertUsageRows, openUsageDb, parseUsageRecord, pruneUsage, queryTimeline, type UsageInput } from './usage-db';
+import { createAuth, loadRemoteConfig } from './auth';
+import { createStaticHandler } from './static';
+import { createAuditMiddleware, ensureAuditSchema, recentAudit } from './audit';
+import { createCallGate } from './limits';
+import { Broadcaster, TtlCache, responseCache } from './shared-cache';
+import { apiSecurityHeaders, createLocalGuard, isDirectLocalRequest, isMgmtAllowed, redactSecrets } from './security';
+import {
+  QUOTA_CACHE_MAX_AGE_MS,
+  QUOTA_CACHE_VERSION,
+  buildQuotaGroup,
+  formatCountdownEn,
+  formatCountdownZh,
+  fractionToPct,
+  freshenQuotaSnapshot,
+} from './quota';
 
 const PROXY_URL = (process.env.ANTI_UI_PROXY_URL ?? 'http://127.0.0.1:8317').replace(/\/$/, '');
+const AGENTROUTER_PROXY_URL = (process.env.ANTI_UI_AGENTROUTER_URL ?? 'http://127.0.0.1:15721').replace(/\/$/, '');
+// WorkBuddy 本地网关（workbuddy2api，Go）—— 独立进程，自带 /healthz、/status、/v1/stats
+const WORKBUDDY_URL = (process.env.ANTI_UI_WORKBUDDY_URL ?? 'http://127.0.0.1:7863').replace(/\/$/, '');
+const WORKBUDDY_KEY = process.env.ANTI_UI_WORKBUDDY_KEY ?? '';
 const MGMT_KEY = process.env.ANTI_UI_MGMT_KEY ?? '';
 const PORT = Number(process.env.ANTI_UI_PORT ?? 4310);
 const WEB_ORIGIN = process.env.ANTI_UI_WEB_ORIGIN ?? 'http://127.0.0.1:4321';
 
 const app = new Hono();
 
-// ---- Usage statistics store (bun:sqlite) ----
-const db = new Database('usage.sqlite', { create: true });
-db.run(`CREATE TABLE IF NOT EXISTS usage (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL,
-  model TEXT NOT NULL,
-  account TEXT NOT NULL,
-  input_tokens INTEGER DEFAULT 0,
-  output_tokens INTEGER DEFAULT 0,
-  reasoning_tokens INTEGER DEFAULT 0,
-  total_tokens INTEGER DEFAULT 0,
-  latency_ms INTEGER DEFAULT 0,
-  failed INTEGER DEFAULT 0
-)`);
-db.run(`CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model)`);
-db.run(`CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)`);
+// ---- Usage statistics store (bun:sqlite; schema + migrations live in usage-db.ts) ----
+const db = openUsageDb('usage.sqlite');
+
+// The gateway's usage queue is drained destructively, so rows it hands over must not be lost if the
+// insert fails: keep them here and retry together with the next batch.
+let pendingUsage: UsageInput[] = [];
+const MAX_PENDING_USAGE = 5000;
 
 let consuming = false;
 async function consumeUsageQueue() {
@@ -33,43 +46,97 @@ async function consumeUsageQueue() {
   consuming = true;
   try {
     const res = await mgmt('/usage-queue?count=200');
-    if (!res.ok) return;
-    const data: any = await res.json();
-    const rows = Array.isArray(data) ? data : [];
-    const insert = db.prepare(
-      `INSERT INTO usage (ts, model, account, input_tokens, output_tokens, reasoning_tokens, total_tokens, latency_ms, failed)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (const r of rows) {
+    const data: any = res.ok ? await res.json() : [];
+    const fetched: UsageInput[] = (Array.isArray(data) ? data : []).map((r: any) => {
       const t = r.tokens ?? {};
-      insert.run(
-        r.timestamp ?? new Date().toISOString(),
-        r.model ?? 'unknown',
-        r.source ?? r.account ?? 'unknown',
-        t.input_tokens ?? 0,
-        t.output_tokens ?? 0,
-        t.reasoning_tokens ?? 0,
-        t.total_tokens ?? 0,
-        r.latency_ms ?? 0,
-        r.failed ? 1 : 0,
-      );
+      return {
+        ts: r.timestamp ?? new Date().toISOString(),
+        model: r.model ?? 'unknown',
+        account: r.source ?? r.account ?? 'unknown',
+        input_tokens: t.input_tokens ?? 0,
+        output_tokens: t.output_tokens ?? 0,
+        reasoning_tokens: t.reasoning_tokens ?? 0,
+        total_tokens: t.total_tokens ?? 0,
+        latency_ms: r.latency_ms ?? 0,
+        failed: Boolean(r.failed),
+        group: 'antigravity', // everything in CLIProxyAPI's queue was served by CLIProxyAPI
+      };
+    });
+    const batch = [...pendingUsage, ...fetched];
+    if (!batch.length) return;
+    try {
+      insertUsageRows(db, batch);
+      pendingUsage = [];
+      console.log(`[usage] consumed ${batch.length} records`);
+    } catch (e) {
+      pendingUsage = batch.slice(-MAX_PENDING_USAGE);
+      console.error(`[usage] insert failed, keeping ${pendingUsage.length} rows for retry:`, e);
     }
-    if (rows.length) console.log(`[usage] consumed ${rows.length} records`);
-  } catch (e) {
-    // transient; retry next tick
+  } catch {
+    // gateway unreachable; retry next tick
   } finally {
     consuming = false;
   }
 }
 
+// Remote mode (ANTI_UI_REMOTE=1) adds token auth and lets a tunnel's hostname through; default is loopback-only.
+const remote = loadRemoteConfig(process.env);
+const auth = createAuth(remote);
+
+const BIND_HOST = process.env.ANTI_UI_BIND_HOST ?? '127.0.0.1';
+if (!['127.0.0.1', 'localhost', '::1'].includes(BIND_HOST) && !remote.enabled) {
+  throw new Error(`ANTI_UI_BIND_HOST=${BIND_HOST} exposes the dashboard beyond this machine; set ANTI_UI_REMOTE=1 (with tokens) first`);
+}
+
+const WEB_ORIGINS = [
+  ...new Set([
+    WEB_ORIGIN,
+    'http://127.0.0.1:4321',
+    'http://localhost:4321',
+    ...remote.webOrigins,
+    ...remote.allowedHosts.map((h) => `https://${h}`),
+  ]),
+];
+
+// Order matters: guard (Host/Origin) -> cors (answers preflight) -> auth (credentials, roles).
+app.use('/api/*', apiSecurityHeaders);
+app.use('/api/*', createLocalGuard({ port: PORT, webOrigins: WEB_ORIGINS, allowedHosts: remote.allowedHosts }));
 app.use(
   '/api/*',
   cors({
-    origin: [WEB_ORIGIN, 'http://localhost:4321'],
-    allowHeaders: ['Content-Type', 'Authorization'],
+    origin: WEB_ORIGINS,
+    credentials: true,
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Record-Key'],
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   }),
 );
+ensureAuditSchema(db);
+if (remote.enabled) app.use('/api/*', createAuditMiddleware(db, auth)); // before auth so refused logins are recorded too
+app.use('/api/*', auth.middleware);
+auth.registerRoutes(app);
+
+app.get('/api/audit', (c) => {
+  if (auth.roleOf(c) !== 'admin') return c.json({ error: 'admin role required' }, 403);
+  return c.json({ remote: remote.enabled, rows: recentAudit(db, Number(c.req.query('limit') ?? 100)) });
+});
+
+// Calls that spend real upstream quota (or act with an account's OAuth token) get a circuit breaker.
+// Generous for the "test everything" button, tight against a runaway loop.
+app.use('/api/test/model', createCallGate({ max: 120, windowMs: 60_000, concurrency: 3 }));
+app.use('/api/auth/test', createCallGate({ max: 30, windowMs: 60_000, concurrency: 2 }));
+
+// Upstream-facing work is shared between viewers: N open browsers cost what one does.
+const shared = new TtlCache();
+/** CLIProxyAPI's auth-file list, fetched at most once per 2s however many viewers/pages ask. */
+const getAuthFiles = () =>
+  shared.get('auth-files', 2000, async () => {
+    const res = await mgmt('/auth-files');
+    if (!res.ok) throw new Error(`auth-files ${res.status}`);
+    const data: any = await res.json();
+    return (data.files ?? []) as any[];
+  });
+app.use('/api/health', responseCache(shared, 5_000)); // fans out to every gateway
+app.use('/api/quota', responseCache(shared, 20_000)); // ends in language_server RPCs, which in turn reach Google
 
 /** Forward any call to the CLIProxyAPI Management API, injecting the secret. */
 async function mgmt(path: string, init?: RequestInit): Promise<Response> {
@@ -85,42 +152,211 @@ async function mgmt(path: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
-// ---- Generic management proxy (everything under /v0/management) ----
+/** Forward any call to the WorkBuddy gateway, injecting its own bearer key. */
+async function wbFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${WORKBUDDY_URL}${path}`, {
+    ...init,
+    headers: {
+      ...(WORKBUDDY_KEY ? { Authorization: `Bearer ${WORKBUDDY_KEY}` } : {}),
+      'Content-Type': 'application/json',
+      ...(init?.headers ?? {}),
+    },
+  });
+}
+
+// ---- Management proxy: allowlisted (method, path) pairs only, see security.ts ----
 app.all('/api/mgmt/*', async (c) => {
   const path = c.req.path.replace('/api/mgmt', '');
+  if (!isMgmtAllowed(c.req.method, path)) {
+    return c.json({ error: `management endpoint not allowed: ${c.req.method} ${path}` }, 403);
+  }
+  // A login from a new device/IP is the classic trigger for account review, and remote OAuth is unreliable anyway.
+  if (remote.enabled && path === '/antigravity-auth-url' && !isDirectLocalRequest(c)) {
+    return c.json({ error: 'OAuth sign-in is only available from the machine running the dashboard (open http://127.0.0.1:' + PORT + ' there)' }, 403);
+  }
   const query = new URL(c.req.url).search;
   const body = ['GET', 'HEAD'].includes(c.req.method) ? undefined : await c.req.text().catch(() => undefined);
   const res = await mgmt(path + query, body ? { method: c.req.method, body } : { method: c.req.method });
   const text = await res.text();
+  if (c.req.method !== 'GET') shared.invalidate(); // account state changed: do not serve a stale list/health/quota
+  // The config page only displays this; never hand API keys / management secrets to the browser.
+  if (path === '/config' && res.ok) {
+    try {
+      return c.json(redactSecrets(JSON.parse(text)) as any);
+    } catch {
+      /* not JSON: fall through and return as-is */
+    }
+  }
   return new Response(text, { status: res.status, headers: { 'Content-Type': 'application/json' } });
 });
 
-// ---- Proxy /v1/models (OpenAI-compatible model list) ----
-app.get('/api/models', async (c) => {
-  const res = await fetch(`${PROXY_URL}/v1/models`);
-  return new Response(res.body, { status: res.status, headers: { 'Content-Type': 'application/json' } });
+// ---- Credential check: fixed tokeninfo call made server-side, so the browser never needs the generic /api-call ----
+app.post('/api/auth/test', async (c) => {
+  const { auth_index } = await c.req.json().catch(() => ({} as any));
+  if (typeof auth_index !== 'string' || !/^[\w.-]{1,128}$/.test(auth_index)) {
+    return c.json({ error: 'valid auth_index required' }, 400);
+  }
+  try {
+    const res = await mgmt('/api-call', {
+      method: 'POST',
+      body: JSON.stringify({
+        method: 'GET',
+        url: 'https://oauth2.googleapis.com/tokeninfo',
+        auth_index,
+        header: { Authorization: 'Bearer $TOKEN$' },
+      }),
+    });
+    const text = await res.text();
+    return new Response(text, { status: res.status, headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return c.json({ error: String(e) }, 502);
+  }
 });
 
-// ---- Test a model's real availability through the proxy ----
-app.post('/api/test/model', async (c) => {
-  const { model } = await c.req.json().catch(() => ({} as any));
-  if (!model) return c.json({ error: 'model required' }, 400);
-  const start = Date.now();
+// ---- Proxy /v1/models (Unified Model list with Antigravity & AgentRouter groups) ----
+app.get('/api/models', async (c) => {
+  const [antiRes, arRes, wbRes] = await Promise.allSettled([
+    fetch(`${PROXY_URL}/v1/models`),
+    fetch(`${AGENTROUTER_PROXY_URL}/v1/models`),
+    wbFetch('/v1/models'),
+  ]);
+
+  let antiModels: any[] = [];
+  if (antiRes.status === 'fulfilled' && antiRes.value.ok) {
+    const j: any = await antiRes.value.json().catch(() => ({}));
+    antiModels = (j.data ?? []).map((m: any) => ({
+      ...m,
+      group: 'antigravity',
+      provider: 'Google Antigravity',
+      endpoints: ['openai'],
+      pricing: priceFor(m.id, 'antigravity'),
+    }));
+  }
+
+  let arModels: any[] = [];
+  if (arRes.status === 'fulfilled' && arRes.value.ok) {
+    const j: any = await arRes.value.json().catch(() => ({}));
+    arModels = (j.data ?? []).map((m: any) => ({
+      ...m,
+      group: 'agentrouter',
+      provider: m.id === 'agentrouter-race' ? 'AgentRouter (5-Model Racing 竞速)' : 'AgentRouter',
+      endpoints: m.id === 'gpt-5.6-sol' ? ['openai'] : ['openai', 'anthropic'],
+      pricing: priceFor(m.id, 'agentrouter'),
+    }));
+  }
+
+  // WorkBuddy：积分制（非美元计费），pricing 记 0；credits 倍率透传给 UI 展示
+  let wbModels: any[] = [];
+  if (wbRes.status === 'fulfilled' && wbRes.value.ok) {
+    const j: any = await wbRes.value.json().catch(() => ({}));
+    wbModels = (j.data ?? []).map((m: any) => {
+      const realm = String(m.id).startsWith('cn:') ? 'cn' : 'global';
+      return {
+        ...m,
+        group: 'workbuddy',
+        realm,
+        provider: realm === 'cn' ? 'WorkBuddy · 国内节点' : 'WorkBuddy · 全球节点',
+        endpoints: ['openai'],
+        pricing: { input: 0, output: 0 },
+      };
+    });
+  }
+
+  return c.json({
+    object: 'list',
+    data: [...antiModels, ...arModels, ...wbModels],
+    groups: ['antigravity', 'agentrouter', 'workbuddy'],
+    success: true,
+  });
+});
+
+// ---- AgentRouter Dedicated Stats API ----
+app.get('/api/agentrouter/stats', async (c) => {
   try {
-    const res = await fetch(`${PROXY_URL}/v1/chat/completions`, {
+    const res = await fetch(`${AGENTROUTER_PROXY_URL}/stats`);
+    if (res.ok) {
+      const data = await res.json();
+      return c.json(data);
+    }
+    return c.json({ ok: false, error: `HTTP ${res.status}` }, res.status as any);
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 502);
+  }
+});
+
+// ---- WorkBuddy Dedicated API（账号池 / 用量 / 账号管理，独立 bearer） ----
+app.get('/api/workbuddy/status', async (c) => {
+  try {
+    const res = await wbFetch('/status');
+    const text = await res.text();
+    return new Response(text, { status: res.status, headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 502);
+  }
+});
+
+app.get('/api/workbuddy/stats', async (c) => {
+  try {
+    const res = await wbFetch('/v1/stats');
+    const text = await res.text();
+    return new Response(text, { status: res.status, headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 502);
+  }
+});
+
+// 账号管理写操作：disable / enable / revive（转发到网关 /admin/accounts/{uid}/{action}）
+app.post('/api/workbuddy/accounts/:uid/:action', async (c) => {
+  const uid = c.req.param('uid');
+  const action = c.req.param('action');
+  if (!['disable', 'enable', 'revive'].includes(action)) {
+    return c.json({ ok: false, error: `unsupported action: ${action}` }, 400);
+  }
+  try {
+    const body = await c.req.text().catch(() => '');
+    const res = await wbFetch(`/admin/accounts/${encodeURIComponent(uid)}/${action}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      body: body && body.length ? body : '{}',
+    });
+    const text = await res.text();
+    shared.invalidate(); // pool state changed: drop cached health
+    return new Response(text, { status: res.status, headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 502);
+  }
+});
+
+// ---- Test a model's real availability through the corresponding proxy ----
+app.post('/api/test/model', async (c) => {
+  const { model, group } = await c.req.json().catch(() => ({} as any));
+  if (!model) return c.json({ error: 'model required' }, 400);
+
+  const isAgentRouter = group === 'agentrouter' || AGENTROUTER_MODELS.includes(model);
+  const isWorkBuddy = group === 'workbuddy' || isWorkBuddyModel(model);
+  const targetBaseUrl = isWorkBuddy ? WORKBUDDY_URL : isAgentRouter ? AGENTROUTER_PROXY_URL : PROXY_URL;
+  const targetGroup = isWorkBuddy ? 'workbuddy' : isAgentRouter ? 'agentrouter' : 'antigravity';
+  const probeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+  // WorkBuddy 网关全接口强制 Bearer 鉴权（/healthz 除外）
+  if (isWorkBuddy && WORKBUDDY_KEY) probeHeaders.Authorization = `Bearer ${WORKBUDDY_KEY}`;
+  const start = Date.now();
+
+  try {
+    const res = await fetch(`${targetBaseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: probeHeaders,
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
-        max_tokens: 10,
+        max_tokens: 15,
       }),
     });
     const text = await res.text();
     let reply = '';
+    let winner = undefined;
     try {
       const j = JSON.parse(text);
       reply = j.choices?.[0]?.message?.content ?? '';
+      winner = j.model;
     } catch {
       /* non-JSON error body */
     }
@@ -128,11 +364,18 @@ app.post('/api/test/model', async (c) => {
       ok: res.ok,
       status: res.status,
       latency_ms: Date.now() - start,
-      reply: reply.slice(0, 60),
+      reply: reply.slice(0, 80),
+      winner,
+      group: targetGroup,
       error: res.ok ? undefined : text.slice(0, 200),
     });
   } catch (e) {
-    return c.json({ ok: false, latency_ms: Date.now() - start, error: String(e) });
+    return c.json({
+      ok: false,
+      latency_ms: Date.now() - start,
+      group: targetGroup,
+      error: String(e),
+    });
   }
 });
 
@@ -141,6 +384,7 @@ app.get('/api/usage/models', (c) => {
   const rows = db
     .query(
       `SELECT model,
+              COALESCE(MAX(grp), 'antigravity') AS "group",
               COUNT(*) AS calls,
               SUM(CASE WHEN failed = 0 THEN 1 ELSE 0 END) AS success,
               SUM(CASE WHEN failed = 1 THEN 1 ELSE 0 END) AS failed,
@@ -188,134 +432,70 @@ app.get('/api/usage/summary', (c) => {
 });
 
 // ---- Antigravity Native Quota Detection & Caching ----
-let cachedLsPort: { port: number; csrf: string; isHttps: boolean } | null = null;
-const QUOTA_CACHE_FILE = 'quota_cache.json';
-
-function saveQuotaCache(data: any) {
-  try {
-    const toSave = { ...data, cachedAt: new Date().toISOString() };
-    Bun.write(QUOTA_CACHE_FILE, JSON.stringify(toSave, null, 2));
-  } catch {}
+// Quota snapshots are cached PER ACCOUNT. The local Antigravity IDE is only ever
+// signed into one account at a time, so a single shared cache file would serve
+// that account's quota under a different account's name. Key by email instead.
+function quotaCachePathFor(email: string) {
+  return `quota_cache_${email.replace(/[^a-zA-Z0-9._@-]/g, '_')}.json`;
 }
 
-async function loadQuotaCache(): Promise<any | null> {
+async function saveQuotaCache(data: any, email: string) {
+  if (!email) return;
+  const toSave = { ...data, cacheVersion: QUOTA_CACHE_VERSION, cachedAt: new Date().toISOString(), cachedFor: email };
   try {
-    const file = Bun.file(QUOTA_CACHE_FILE);
-    if (await file.exists()) {
-      return await file.json();
-    }
-  } catch {}
-  return null;
-}
-
-async function detectLanguageServer(): Promise<{ port: number; csrf: string; isHttps: boolean } | null> {
-  // 1. Try cached port first for speed
-  if (cachedLsPort) {
-    try {
-      const proto = cachedLsPort.isHttps ? 'https' : 'http';
-      const url = `${proto}://127.0.0.1:${cachedLsPort.port}/exa.language_server_pb.LanguageServerService/GetUserStatus`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Connect-Protocol-Version': '1',
-          'X-Codeium-Csrf-Token': cachedLsPort.csrf,
-        },
-        body: JSON.stringify({
-          metadata: { ideName: 'antigravity', extensionName: 'antigravity', ideVersion: '2.8.1', locale: 'en' },
-        }),
-        tls: { rejectUnauthorized: false } as any,
-        signal: AbortSignal.timeout(1500),
-      });
-      if (res.ok) return cachedLsPort;
-    } catch {
-      cachedLsPort = null;
-    }
+    await Bun.write(quotaCachePathFor(email), JSON.stringify(toSave, null, 2));
+  } catch (e) {
+    console.warn(`[quota] failed to write cache for ${email}:`, e);
   }
+}
 
-  // 2. Discover CSRF token from running process
-  let csrf = '';
+async function loadQuotaCache(email: string): Promise<any | null> {
+  if (!email) return null;
   try {
-    const ps = Bun.spawn(['pgrep', '-fl', 'language_server']);
-    const psOut = await new Response(ps.stdout).text();
-    const mCsrf = psOut.match(/--csrf_token[=\s]+([a-f0-9-]+)/i);
-    if (mCsrf) csrf = mCsrf[1];
+    const file = Bun.file(quotaCachePathFor(email));
+    if (!(await file.exists())) return null;
+    const data = await file.json();
+    // Only trust a snapshot recorded for this account, in the current format (older ones stored
+    // pre-formatted countdown strings with no reset timestamps, so they cannot be re-aged).
+    if (data?.cacheVersion !== QUOTA_CACHE_VERSION || data.cachedFor !== email) return null;
+    const ageMs = Date.now() - new Date(data.cachedAt).getTime();
+    if (!(ageMs >= 0 && ageMs <= QUOTA_CACHE_MAX_AGE_MS)) return null;
+    return data;
   } catch {
-    // fallback
+    return null;
   }
+}
 
-  // 3. Scan ports
-  const candidatePorts: number[] = [];
+/** Which quota pool a model id belongs to (Claude / GPT-OSS share one, Gemini has its own). */
+function quotaGroupOf(modelIdOrLabel: string): 'claude_gpt' | 'gemini' {
+  const s = modelIdOrLabel.toLowerCase();
+  return s.includes('claude') || s.includes('gpt') ? 'claude_gpt' : 'gemini';
+}
+
+/** Used only when the gateway's /v1/models is unreachable. */
+const FALLBACK_QUOTA_MODELS = [
+  { label: 'Gemini 3.8 Flash (High)', modelId: 'gemini-3.8-flash-high' },
+  { label: 'Gemini 3.7 Flash (High)', modelId: 'gemini-3.7-flash-high' },
+  { label: 'Gemini 3.6 Flash (High)', modelId: 'gemini-3.6-flash-high' },
+  { label: 'Gemini 3.1 Pro (Low)', modelId: 'gemini-3.1-pro-low' },
+  { label: 'Claude Sonnet 4.6 (Thinking)', modelId: 'claude-sonnet-4-6' },
+  { label: 'Claude Opus 4.6 (Thinking)', modelId: 'claude-opus-4-6' },
+  { label: 'GPT-OSS 120B (Medium)', modelId: 'gpt-oss-120b' },
+];
+
+/** Models the gateway actually serves, so the per-account list is not a hand-maintained copy. */
+async function listGatewayQuotaModels(): Promise<Array<{ label: string; modelId: string }>> {
   try {
-    const lsof = Bun.spawn(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN']);
-    const lsofOut = await new Response(lsof.stdout).text();
-    for (const l of lsofOut.split('\n')) {
-      if (l.toLowerCase().includes('language') || l.toLowerCase().includes('antigravity')) {
-        const m = l.match(/:(\d+)\s+\(LISTEN\)/);
-        if (m) candidatePorts.push(parseInt(m[1], 10));
-      }
+    const res = await fetch(`${PROXY_URL}/v1/models`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) {
+      const j: any = await res.json();
+      const ids: string[] = (j.data ?? []).map((m: any) => m?.id).filter((id: any) => typeof id === 'string');
+      if (ids.length) return ids.map((id) => ({ label: id, modelId: id }));
     }
   } catch {
-    // fallback to port range
+    /* fall back below */
   }
-
-  // Also include standard Antigravity port range
-  for (let p = 51000; p <= 51080; p++) {
-    if (!candidatePorts.includes(p)) candidatePorts.push(p);
-  }
-  for (let p = 61000; p <= 61080; p++) {
-    if (!candidatePorts.includes(p)) candidatePorts.push(p);
-  }
-
-  for (const port of candidatePorts) {
-    for (const isHttps of [true, false]) {
-      try {
-        const proto = isHttps ? 'https' : 'http';
-        const url = `${proto}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus`;
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Connect-Protocol-Version': '1',
-            'X-Codeium-Csrf-Token': csrf || 'any',
-          },
-          body: JSON.stringify({
-            metadata: { ideName: 'antigravity', extensionName: 'antigravity', ideVersion: '2.8.1', locale: 'en' },
-          }),
-          tls: { rejectUnauthorized: false } as any,
-          signal: AbortSignal.timeout(400),
-        });
-        if (res.ok) {
-          cachedLsPort = { port, csrf: csrf || 'any', isHttps };
-          return cachedLsPort;
-        }
-      } catch {
-        // continue scanning
-      }
-    }
-  }
-
-  return null;
-}
-
-function formatCountdownEn(ms: number): string {
-  if (ms <= 0) return 'fully refreshed';
-  const mins = Math.floor(ms / 60000);
-  const hours = Math.floor(mins / 60);
-  const days = Math.floor(hours / 24);
-  if (days > 0) return `${days} days, ${hours % 24} hours`;
-  if (hours > 0) return `${hours} hours, ${mins % 60} minutes`;
-  return `${mins} minutes`;
-}
-
-function formatCountdownZh(ms: number): string {
-  if (ms <= 0) return '已完全刷新';
-  const mins = Math.floor(ms / 60000);
-  const hours = Math.floor(mins / 60);
-  const days = Math.floor(hours / 24);
-  if (days > 0) return `${days} 天 ${hours % 24} 小时`;
-  if (hours > 0) return `${hours} 小时 ${mins % 60} 分钟`;
-  return `${mins} 分钟`;
+  return FALLBACK_QUOTA_MODELS;
 }
 
 app.get('/api/quota', async (c) => {
@@ -325,59 +505,56 @@ app.get('/api/quota', async (c) => {
   // 1. Get all configured accounts from CLIProxyAPI
   let accounts: any[] = [];
   try {
-    const authRes = await mgmt('/auth-files');
-    if (authRes.ok) {
-      const data: any = await authRes.json();
-      accounts = data.files ?? [];
-    }
+    accounts = await getAuthFiles();
   } catch {
     // fallback
   }
 
-  // 2. Detect local Antigravity Language Server
-  const detected = await detectLanguageServer();
-  let localData: any = null;
-  if (detected) {
-    try {
-      const proto = detected.isHttps ? 'https' : 'http';
-      const url = `${proto}://127.0.0.1:${detected.port}/exa.language_server_pb.LanguageServerService/GetUserStatus`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Connect-Protocol-Version': '1',
-          'X-Codeium-Csrf-Token': detected.csrf,
-        },
-        body: JSON.stringify({
-          metadata: { ideName: 'antigravity', extensionName: 'antigravity', ideVersion: '2.8.1', locale: 'en' },
-        }),
-        tls: { rejectUnauthorized: false } as any,
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok) {
-        localData = await res.json();
-      }
-    } catch {
-      // ignore
-    }
-  }
+  // 2. Live data from every running Antigravity language server (one per signed-in account)
+  const live = await fetchLiveSnapshots();
+  const liveByEmail = new Map(live.map((l) => [l.email, l]));
 
-  // 3. Match active account
-  const localEmail = localData?.userStatus?.userTier?.upgradeSubscriptionUri
-    ? new URL(localData.userStatus.userTier.upgradeSubscriptionUri).searchParams.get('Email') || 'pilaoban2004@gmail.com'
-    : 'pilaoban2004@gmail.com';
-
+  // 3. Match active account: the one asked for, else the first signed in to an IDE, else the first configured
   const activeAccount =
     accounts.find((a) => (selectedEmail && a.email === selectedEmail) || (selectedAuthIndex && a.auth_index === selectedAuthIndex)) ||
-    accounts.find((a) => a.email === localEmail) ||
+    accounts.find((a) => liveByEmail.has(a.email)) ||
     accounts[0];
 
-  const targetEmail = activeAccount?.email || localEmail || '未知账号';
-  const isLocalLive = !!localData && (targetEmail === localEmail || !selectedEmail);
+  const targetEmail = activeAccount?.email || live[0]?.email || '未知账号';
+  const liveSnap = liveByEmail.get(targetEmail);
 
-  // 4. Live local Language Server data for local active account
-  if (isLocalLive && localData) {
-    const userStatus = localData.userStatus ?? {};
+  const accountsView = accounts.map((a) => ({
+    email: a.email,
+    auth_index: a.auth_index,
+    status: a.status,
+    disabled: a.disabled,
+    isCurrentIde: liveByEmail.has(a.email),
+    cooldowns: a.cooldowns || [],
+  }));
+
+  // Cooldowns from CLIProxyAPI (real 429 quota exhaustion signals!)
+  const now = Date.now();
+  const cooldowns: any[] = activeAccount?.cooldowns || [];
+  const hasCooldown = cooldowns.length > 0;
+  const maxCooldownSec = hasCooldown ? Math.max(...cooldowns.map((cd: any) => cd.remaining_seconds || 0), 0) : 0;
+  const cooldownMs = maxCooldownSec * 1000;
+  const cooldownZh = formatCountdownZh(cooldownMs);
+  const cooldownEn = formatCountdownEn(cooldownMs);
+  const cooldownEndsAt = hasCooldown ? new Date(now + cooldownMs).toISOString() : null;
+  const cooldownFields = { cooldowns, cooldownZh, cooldownEn, cooldownEndsAt };
+  const cooldownKeys = new Set<string>(cooldowns.map((cd: any) => cd.model_key).filter(Boolean));
+  // CLIProxyAPI cools Gemini per account, so any cooldown covers every Gemini model.
+  const modelCooling = (modelId: string) =>
+    hasCooldown && (cooldownKeys.size === 0 || cooldownKeys.has(modelId) || quotaGroupOf(modelId) === 'gemini');
+  // The IDE reports opaque model ids (MODEL_PLACEHOLDER_*) that never match a cooldown's model_key, so go by pool.
+  const groupCooling = (g: 'gemini' | 'claude_gpt') =>
+    hasCooldown && (cooldownKeys.size === 0 || g === 'gemini' || [...cooldownKeys].some((k) => quotaGroupOf(k) === g));
+
+  // 4. Live data from the IDE signed in as the target account
+  if (liveSnap) {
+    const localData = liveSnap.status;
+    const localQuotaSummary = liveSnap.quotaSummary;
+    const userStatus = localData?.userStatus ?? {};
     const userTier = userStatus.userTier ?? {};
     const planStatus = userStatus.planStatus ?? {};
     const modelConfigs = userStatus.cascadeModelConfigData?.clientModelConfigs ?? [];
@@ -387,46 +564,43 @@ app.get('/api/quota', async (c) => {
       .map((m: any) => {
         const q = m.quotaInfo;
         const rem = q.remainingFraction;
-        const resetDate = q.resetTime ? new Date(q.resetTime) : null;
-        const msUntilReset = resetDate ? resetDate.getTime() - Date.now() : 0;
+        const resetMs = q.resetTime ? Math.max(0, new Date(q.resetTime).getTime() - now) : 0;
         const label = m.label ?? '未知模型';
-        const modelId = m.modelOrAlias?.model ?? '';
-        const pct = rem !== undefined ? Math.round(rem * 1000) / 10 : 0;
-        const isClaudeOrGpt = label.toLowerCase().includes('claude') || label.toLowerCase().includes('gpt');
 
         return {
           label,
-          modelId,
-          group: isClaudeOrGpt ? 'claude_gpt' : 'gemini',
+          modelId: m.modelOrAlias?.model ?? '',
+          group: quotaGroupOf(label),
           remainingFraction: rem,
-          remainingPercentage: pct,
+          remainingPercentage: fractionToPct(rem) ?? 0,
           resetTime: q.resetTime,
-          timeRemainingZh: formatCountdownZh(msUntilReset),
-          timeRemainingEn: formatCountdownEn(msUntilReset),
+          timeRemainingZh: formatCountdownZh(resetMs),
+          timeRemainingEn: formatCountdownEn(resetMs),
           isExhausted: rem === undefined || rem <= 0,
         };
       });
+    const firstModel = (g: 'gemini' | 'claude_gpt') => parsedModels.find((m: any) => m.group === g);
 
-    const geminiModels = parsedModels.filter((m: any) => m.group === 'gemini');
-    const claudeGptModels = parsedModels.filter((m: any) => m.group === 'claude_gpt');
+    // Parse authoritative groups from RetrieveUserQuotaSummary
+    const summaryGroups = localQuotaSummary?.response?.groups || [];
+    const geminiGroup = summaryGroups.find((g: any) => g.displayName?.toLowerCase().includes('gemini'));
+    const claudeGroup = summaryGroups.find(
+      (g: any) => g.displayName?.toLowerCase().includes('claude') || g.displayName?.toLowerCase().includes('gpt'),
+    );
+    const bucket = (g: any, id: string, window: string) =>
+      g?.buckets?.find((b: any) => b.bucketId === id || b.window === window);
 
-    const fiveHourGeminiFraction = geminiModels.length ? Math.min(...geminiModels.map((m: any) => m.remainingFraction ?? 1)) : 1.0;
-    const fiveHourClaudeFraction = claudeGptModels.length ? Math.min(...claudeGptModels.map((m: any) => m.remainingFraction ?? 1)) : 1.0;
+    // A window the IDE did not report stays `null` (unknown); it is never defaulted to 100%.
+    const fiveHour = (b: any, g: 'gemini' | 'claude_gpt') =>
+      b?.remainingFraction !== undefined
+        ? { fraction: b.remainingFraction, resetAt: b.resetTime }
+        : { fraction: firstModel(g)?.remainingFraction, resetAt: b?.resetTime ?? firstModel(g)?.resetTime };
+    const weekly = (b: any) => ({ fraction: b?.remainingFraction, resetAt: b?.resetTime });
 
-    const gemini5hPct = Math.round(fiveHourGeminiFraction * 100);
-    const claude5hPct = Math.round(fiveHourClaudeFraction * 100);
-
-    // 动态计算周限百分比与重置倒计时：
-    // 当 5 小时满额或接近满额（>=95%）时，周限为 99%~100%，倒计时跟随自然周
-    // 当 5 小时在 80%~94% 时，周限精确对齐为 98%
-    const geminiWeeklyPct = gemini5hPct >= 95 ? 99 : gemini5hPct >= 80 ? 98 : gemini5hPct;
-    const claudeWeeklyPct = claude5hPct >= 95 ? 100 : 42;
-
-    const geminiResetDate = geminiModels[0]?.resetTime ? new Date(geminiModels[0].resetTime) : null;
-    const claudeResetDate = claudeGptModels[0]?.resetTime ? new Date(claudeGptModels[0].resetTime) : null;
-
-    const gemini5hMs = geminiResetDate ? Math.max(0, geminiResetDate.getTime() - Date.now()) : 0;
-    const claude5hMs = claudeResetDate ? Math.max(0, claudeResetDate.getTime() - Date.now()) : 0;
+    const geminiWeeklyBucket = bucket(geminiGroup, 'gemini-weekly', 'weekly');
+    const gemini5hBucket = bucket(geminiGroup, 'gemini-5h', '5h');
+    const claudeWeeklyBucket = bucket(claudeGroup, '3p-weekly', 'weekly');
+    const claude5hBucket = bucket(claudeGroup, '3p-5h', '5h');
 
     const availableCredits = planStatus.availablePromptCredits;
     const monthlyCredits = planStatus.planInfo?.monthlyPromptCredits;
@@ -434,59 +608,61 @@ app.get('/api/quota', async (c) => {
     const result = {
       online: true,
       source: 'local_ide',
+      accountState: 'active',
       selectedAccount: targetEmail,
-      accounts: accounts.map((a) => ({
-        email: a.email,
-        auth_index: a.auth_index,
-        status: a.status,
-        disabled: a.disabled,
-        isCurrentIde: a.email === localEmail,
-      })),
-      plan: userTier.name ?? 'Google AI Pro',
-      planDescription: userTier.upgradeSubscriptionText ?? 'You can upgrade to a Google AI Ultra plan to receive higher rate limits.',
+      accounts: accountsView,
+      plan: userTier.name ?? null,
+      planDescription: userTier.upgradeSubscriptionText ?? null,
       email: targetEmail,
       promptCredits:
-        monthlyCredits !== undefined && availableCredits !== undefined
+        monthlyCredits > 0 && availableCredits !== undefined
           ? {
               available: availableCredits,
               monthly: monthlyCredits,
               remainingPercentage: Math.round((availableCredits / monthlyCredits) * 1000) / 10,
             }
-          : { available: 500, monthly: 50000, remainingPercentage: 1 },
+          : null,
       summary: {
-        gemini: {
-          title: 'Gemini Models',
-          fiveHourLimitRemaining: gemini5hPct,
-          fiveHourResetEn: formatCountdownEn(gemini5hMs),
-          fiveHourResetZh: formatCountdownZh(gemini5hMs),
-          weeklyLimitRemaining: geminiWeeklyPct,
-          weeklyResetEn: '6 days, 23 hours',
-          weeklyResetZh: '6 天 23 小时',
-        },
-        claude_gpt: {
-          title: 'Claude and GPT models',
-          fiveHourLimitRemaining: claude5hPct,
-          fiveHourResetEn: formatCountdownEn(claude5hMs),
-          fiveHourResetZh: formatCountdownZh(claude5hMs),
-          weeklyLimitRemaining: claudeWeeklyPct,
-          weeklyResetEn: 'fully refreshed',
-          weeklyResetZh: '已完全刷新',
-        },
+        gemini: buildQuotaGroup('Gemini Models', fiveHour(gemini5hBucket, 'gemini'), weekly(geminiWeeklyBucket), now),
+        claude_gpt: buildQuotaGroup(
+          'Claude and GPT models',
+          fiveHour(claude5hBucket, 'claude_gpt'),
+          weekly(claudeWeeklyBucket),
+          now,
+        ),
       },
       models: parsedModels,
     };
 
-    saveQuotaCache(result);
-    return c.json(result);
+    // The cached copy is the IDE's own view only: a 429 cooldown is volatile gateway state, so it is
+    // overlaid on the response below and never written to disk.
+    void saveQuotaCache(result, targetEmail);
+
+    if (!hasCooldown) return c.json(result);
+    return c.json({
+      ...result,
+      accountState: 'cooldown',
+      ...cooldownFields,
+      models: result.models.map((m: any) =>
+        groupCooling(m.group)
+          ? {
+              ...m,
+              isExhausted: true,
+              timeRemainingZh: `${cooldownZh} (429 冷却中)`,
+              timeRemainingEn: `${cooldownEn} (429 cooldown)`,
+            }
+          : m,
+      ),
+    });
   }
 
-  // 5. Account is remote/offline from local IDE or in non-active state
+  // 5. Account is not signed in to a local IDE, or is in a non-active state
   const isDisabled = Boolean(activeAccount?.disabled);
   const statusMsg = activeAccount?.status_message || '';
-  const isNeedsVerify =
-    activeAccount?.status === 'error' ||
-    (typeof statusMsg === 'string' && statusMsg.includes('Verify your account')) ||
-    (typeof statusMsg === 'object' && JSON.stringify(statusMsg).includes('Verify your account'));
+  const statusText = typeof statusMsg === 'string' ? statusMsg : JSON.stringify(statusMsg);
+  const isNeedsVerify = activeAccount?.status === 'error' && statusText.includes('Verify your account');
+  const isTokenExpired = activeAccount?.status === 'error' && statusText.toLowerCase().includes('token expired');
+  const isOtherError = activeAccount?.status === 'error' && !isNeedsVerify && !isTokenExpired;
 
   let validationUrl = '';
   if (statusMsg) {
@@ -506,133 +682,131 @@ app.get('/api/quota', async (c) => {
     validationUrl = 'https://developers.google.com/gemini-code-assist';
   }
 
-  // If this is the active main account (e.g. pilaoban) but local Language Server is closed, load from cache!
-  if (!isDisabled && !isNeedsVerify && (targetEmail === 'pilaoban2004@gmail.com' || targetEmail === localEmail)) {
-    const cached = await loadQuotaCache();
+  // Serve a cached snapshot only if it was recorded for THIS account and not in cooldown.
+  // It is re-aged first: countdowns follow the clock, and windows that have since reset lose their stale %.
+  if (!isDisabled && !isNeedsVerify && !isTokenExpired && !hasCooldown) {
+    const cached = await loadQuotaCache(targetEmail);
     if (cached) {
       return c.json({
-        ...cached,
+        ...freshenQuotaSnapshot(cached, now),
         isCached: true,
         online: true,
         source: 'cached_offline',
         selectedAccount: targetEmail,
-        accounts: accounts.map((a) => ({
-          email: a.email,
-          auth_index: a.auth_index,
-          status: a.status,
-          disabled: a.disabled,
-          isCurrentIde: a.email === localEmail,
-        })),
+        accounts: accountsView,
       });
     }
   }
 
+  const isUnavailable = isDisabled || isNeedsVerify || isTokenExpired || isOtherError;
+
   const accountStatusLabel = isDisabled
     ? '已在反代路由中禁用'
+    : isTokenExpired
+    ? 'Token 已过期 (需重新登录)'
     : isNeedsVerify
     ? '需在 Google 完成账号验证'
-    : '云端备用账号 (正常待命)';
+    : isOtherError
+    ? `异常: ${typeof statusMsg === 'string' ? statusMsg : '请检查账号凭证'}`
+    : hasCooldown
+    ? `429 配额用尽冷却中 (剩余 ${cooldownZh})`
+    : '云端就绪待命 (网关动态路由)';
 
+  // The plan tier of an account that is not signed into the local IDE is unknown; do not guess one.
   const accountPlanName = isDisabled
     ? 'Google AI (已禁用)'
     : isNeedsVerify
     ? 'Google AI (需要完成验证)'
-    : 'Google AI Pro (云端)';
+    : isTokenExpired
+    ? 'Google AI (Token 已过期)'
+    : hasCooldown
+    ? 'Google AI (429 冷却中)'
+    : 'Google AI (套餐未知)';
 
   const accountPlanDesc = isDisabled
     ? '该账号当前已被手动设为禁用状态。如需恢复该账号的模型请求分流，请在「路由策略」页面开启。'
+    : isTokenExpired
+    ? '该账号 Google OAuth 凭据已失效，CLIProxyAPI 无法刷新 Access Token。请重新进行 OAuth 授权。'
     : isNeedsVerify
     ? '该 Google 账号尚未完成 Google Gemini Code Assist 首次安全验证，Google 暂时拦截了调用。'
-    : '该账号已授权接入反代池，处于云端就绪待命状态。';
+    : hasCooldown
+    ? `该账号上游已触发 Google 429 频率/配额限制，CLIProxyAPI 已自动将该账号置于熔断保护中，预计剩余冷却时间：${cooldownZh}。到期后将自动恢复请求分流。`
+    : '该账号已授权接入反代池，但不是本机 Antigravity IDE 当前登录的账号，无法读取真实额度。在 IDE 中登录该账号并打开本页后，额度会被记录下来。';
 
-  const resetTextEn = isDisabled
-    ? 'Account disabled in routing pool'
-    : isNeedsVerify
-    ? 'Needs verification on Google'
-    : 'Fully available (100%)';
+  // Only states we actually know are reported as numbers (0 = unavailable now); a healthy account is `null` (unknown).
+  const models = (await listGatewayQuotaModels()).map((m) => {
+    const group = quotaGroupOf(m.modelId);
+    const cooling = modelCooling(m.modelId);
+    const isExhausted = isUnavailable || cooling;
+    const timeZh = cooling
+      ? `${cooldownZh} (429 冷却中)`
+      : isDisabled
+      ? '账号已在路由池中禁用'
+      : isTokenExpired
+      ? 'Token 已失效'
+      : isNeedsVerify
+      ? '需要在 Google 页面完成验证'
+      : '额度未知';
+    const timeEn = cooling
+      ? `${cooldownEn} (429 cooldown)`
+      : isDisabled
+      ? 'Account disabled'
+      : isTokenExpired
+      ? 'Token expired'
+      : isNeedsVerify
+      ? 'Needs verification'
+      : 'Quota unknown';
 
-  const resetTextZh = isDisabled
-    ? '账号已在路由池中禁用'
-    : isNeedsVerify
-    ? '需要在 Google 页面完成验证'
-    : '配额充足 (100%)';
+    return {
+      label: m.label,
+      modelId: m.modelId,
+      group,
+      remainingFraction: isExhausted ? 0 : null,
+      remainingPercentage: isExhausted ? 0 : null,
+      timeRemainingEn: timeEn,
+      timeRemainingZh: timeZh,
+      isExhausted,
+      statusText: accountStatusLabel,
+    };
+  });
 
-  const geminiRemaining = isDisabled ? 0 : isNeedsVerify ? 0 : 100;
-  const claudeRemaining = isDisabled ? 0 : isNeedsVerify ? 0 : 100;
-
-  const standardModels = [
-    { label: 'Gemini 3.7 Flash (High)', modelId: 'gemini-3.7-flash-high', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-    { label: 'Gemini 3.6 Flash (High)', modelId: 'gemini-3.6-flash-high', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-    { label: 'Gemini 3.5 Flash (High)', modelId: 'gemini-3.5-flash-high', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-    { label: 'Gemini 3.1 Pro (Low)', modelId: 'gemini-3.1-pro-low', group: 'gemini', remainingPercentage: geminiRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-    { label: 'Claude Sonnet 4.6 (Thinking)', modelId: 'claude-sonnet-4-6', group: 'claude_gpt', remainingPercentage: claudeRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-    { label: 'Claude Opus 4.6 (Thinking)', modelId: 'claude-opus-4-6', group: 'claude_gpt', remainingPercentage: claudeRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-    { label: 'GPT-OSS 120B (Medium)', modelId: 'gpt-oss-120b', group: 'claude_gpt', remainingPercentage: claudeRemaining, timeRemainingEn: resetTextEn, timeRemainingZh: resetTextZh, isExhausted: isDisabled || isNeedsVerify, statusText: accountStatusLabel },
-  ];
+  const down = (g: 'gemini' | 'claude_gpt') => {
+    const cooling = groupCooling(g);
+    return { fraction: isUnavailable || cooling ? 0 : null, resetAt: cooling ? cooldownEndsAt : null };
+  };
+  const geminiWindow = down('gemini');
+  const claudeWindow = down('claude_gpt');
 
   return c.json({
-    online: !isDisabled && !isNeedsVerify,
-    source: 'remote_account',
-    accountState: isDisabled ? 'disabled' : isNeedsVerify ? 'error' : 'active',
+    online: !isUnavailable,
+    source: hasCooldown ? 'gateway_cooldown' : 'remote_account',
+    accountState: isDisabled ? 'disabled' : isNeedsVerify || isTokenExpired || isOtherError ? 'error' : hasCooldown ? 'cooldown' : 'active',
     selectedAccount: targetEmail,
-    accounts: accounts.map((a) => ({
-      email: a.email,
-      auth_index: a.auth_index,
-      status: a.status,
-      disabled: a.disabled,
-      isCurrentIde: a.email === localEmail,
-    })),
+    ...cooldownFields,
+    accounts: accountsView,
     plan: accountPlanName,
     planDescription: accountPlanDesc,
     email: targetEmail,
     validationUrl,
-    promptCredits: isDisabled || isNeedsVerify ? { available: 0, monthly: 50000, remainingPercentage: 0 } : { available: 500, monthly: 50000, remainingPercentage: 1 },
+    promptCredits: null,
     summary: {
-      gemini: {
-        title: 'Gemini Models',
-        fiveHourLimitRemaining: geminiRemaining,
-        fiveHourResetEn: resetTextEn,
-        fiveHourResetZh: resetTextZh,
-        weeklyLimitRemaining: geminiRemaining,
-        weeklyResetEn: resetTextEn,
-        weeklyResetZh: resetTextZh,
-      },
-      claude_gpt: {
-        title: 'Claude and GPT models',
-        fiveHourLimitRemaining: claudeRemaining,
-        fiveHourResetEn: resetTextEn,
-        fiveHourResetZh: resetTextZh,
-        weeklyLimitRemaining: claudeRemaining,
-        weeklyResetEn: resetTextEn,
-        weeklyResetZh: resetTextZh,
-      },
+      gemini: buildQuotaGroup('Gemini Models', geminiWindow, geminiWindow, now),
+      claude_gpt: buildQuotaGroup('Claude and GPT models', claudeWindow, claudeWindow, now),
     },
-    models: standardModels,
+    models,
   });
 });
 
-// ---- Model pricing (USD per 1M tokens) ----
-// Official Gemini 3-series pricing provided by the user.
-const MODEL_PRICES: Record<string, { input: number; output: number }> = {
-  // Gemini 3.7 Flash
-  'gemini-3.7-flash-high': { input: 0.75, output: 3.75 },
-  // Gemini 3.6 Flash
-  'gemini-3.6-flash-high': { input: 1.5, output: 7.5 },
-  // Gemini 3.5 Flash
-  'gemini-3.5-flash-low': { input: 1.5, output: 9.0 },
-  // Gemini 3.5 Flash-Lite (lowest-cost tier)
-  'gemini-3.5-flash-extra-low': { input: 0.3, output: 2.5 },
-  'gemini-3.1-flash-lite': { input: 0.3, output: 2.5 },
-  // Gemini 3.1 Pro
-  'gemini-3.1-pro-low': { input: 2.0, output: 12.0 },
-  'gemini-pro-agent': { input: 2.0, output: 12.0 },
-};
-const DEFAULT_PRICE = { input: 1.5, output: 9.0 };
+// ---- Usage timeline / cost endpoints (aggregation lives in usage-db.ts) ----
+app.get('/api/usage/timeline', (c) => {
+  return c.json(queryTimeline(db, c.req.query('period') || '14days'));
+});
 
 app.get('/api/usage/cost', (c) => {
   const rows: any[] = db
     .query(
       `SELECT model,
+              COALESCE(MAX(grp), 'antigravity') AS grp,
               SUM(input_tokens) AS input_tokens,
               SUM(output_tokens) AS output_tokens,
               SUM(reasoning_tokens) AS reasoning_tokens,
@@ -641,16 +815,16 @@ app.get('/api/usage/cost', (c) => {
     )
     .all();
   const perModel = rows.map((r) => {
-    const p = MODEL_PRICES[r.model] ?? DEFAULT_PRICE;
+    // priceFor() already treats WorkBuddy (credit-based) as free, so it cannot inflate the cost charts.
+    const p = priceFor(r.model, isProviderGroup(r.grp) ? r.grp : 'antigravity');
     const output = (r.output_tokens ?? 0) + (r.reasoning_tokens ?? 0);
     const cost = ((r.input_tokens ?? 0) * p.input + output * p.output) / 1e6;
-    return { model: r.model, calls: r.calls, input_tokens: r.input_tokens, output_tokens: r.output_tokens, reasoning_tokens: r.reasoning_tokens, unit_input: p.input, unit_output: p.output, cost };
+    return { model: r.model, group: r.grp, calls: r.calls, input_tokens: r.input_tokens, output_tokens: r.output_tokens, reasoning_tokens: r.reasoning_tokens, unit_input: p.input, unit_output: p.output, cost };
   });
   const total = perModel.reduce((s, m) => s + m.cost, 0);
   return c.json({ total, per_model: perModel });
 });
-
-// ---- Health aggregate ----
+// ---- Health aggregate (with Antigravity & AgentRouter groups) ----
 app.get('/api/health', async (c) => {
   const health: any = {
     ok: false,
@@ -660,66 +834,175 @@ app.get('/api/health', async (c) => {
     errorCount: 0,
     strategy: 'round-robin',
     models: 0,
+    groups: {
+      antigravity: {
+        ok: false,
+        reachable: false,
+        port: 8317,
+        authCount: 0,
+        activeCount: 0,
+        errorCount: 0,
+        strategy: 'round-robin',
+        models: 0,
+      },
+      agentrouter: {
+        ok: false,
+        reachable: false,
+        port: 15721,
+        hasApiKey: false,
+        supportedModels: AGENTROUTER_MODELS,
+        stats: null,
+      },
+      workbuddy: {
+        ok: false,
+        reachable: false,
+        port: 7863,
+        healthy: 0,
+        cooling: 0,
+        disabled: 0,
+        total: 0,
+        realmServable: null as null | Record<string, boolean>,
+        realmTotals: null as any,
+        models: 0,
+      },
+    },
   };
+
   try {
-    const [authRes, stratRes, modelsRes] = await Promise.all([
+    const [authRes, stratRes, modelsRes, arStatsRes, wbStatusRes, wbHealthRes] = await Promise.allSettled([
       mgmt('/auth-files'),
       mgmt('/routing/strategy'),
       fetch(`${PROXY_URL}/v1/models`),
+      fetch(`${AGENTROUTER_PROXY_URL}/stats`),
+      wbFetch('/status'),
+      wbFetch('/healthz'),
     ]);
-    health.proxyReachable = authRes.ok;
-    if (authRes.ok) {
-      const data: any = await authRes.json();
+
+    if (authRes.status === 'fulfilled' && authRes.value.ok) {
+      health.proxyReachable = true;
+      health.groups.antigravity.reachable = true;
+      health.groups.antigravity.ok = true;
+      const data: any = await authRes.value.json().catch(() => ({}));
       const files = data.files ?? [];
       health.authCount = files.length;
       health.activeCount = files.filter((f: any) => !f.disabled && f.status !== 'error').length;
       health.errorCount = files.filter((f: any) => f.status === 'error').length;
+      health.groups.antigravity.authCount = health.authCount;
+      health.groups.antigravity.activeCount = health.activeCount;
+      health.groups.antigravity.errorCount = health.errorCount;
     }
-    if (stratRes.ok) {
-      const s: any = await stratRes.json();
+
+    if (stratRes.status === 'fulfilled' && stratRes.value.ok) {
+      const s: any = await stratRes.value.json().catch(() => ({}));
       health.strategy = s.strategy ?? health.strategy;
+      health.groups.antigravity.strategy = health.strategy;
     }
-    if (modelsRes.ok) {
-      const m: any = await modelsRes.json();
+
+    if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) {
+      const m: any = await modelsRes.value.json().catch(() => ({}));
       health.models = m.data?.length ?? 0;
+      health.groups.antigravity.models = health.models;
     }
-    health.ok = health.proxyReachable;
+
+    if (arStatsRes.status === 'fulfilled' && arStatsRes.value.ok) {
+      const arData: any = await arStatsRes.value.json().catch(() => ({}));
+      health.groups.agentrouter.ok = true;
+      health.groups.agentrouter.reachable = true;
+      health.groups.agentrouter.hasApiKey = arData.hasApiKey ?? false;
+      health.groups.agentrouter.stats = arData.stats;
+      health.agentrouter = health.groups.agentrouter;
+    }
+
+    // WorkBuddy：/healthz 免鉴权给存活与 realm 可服务性，/status 给账号池明细
+    const wbHealth: any =
+      wbHealthRes.status === 'fulfilled' && wbHealthRes.value.ok
+        ? await wbHealthRes.value.json().catch(() => null)
+        : null;
+    const wbStatus: any =
+      wbStatusRes.status === 'fulfilled' && wbStatusRes.value.ok
+        ? await wbStatusRes.value.json().catch(() => null)
+        : null;
+
+    if (wbHealth || wbStatus) {
+      const wb = health.groups.workbuddy;
+      wb.reachable = true;
+      wb.healthy = wbHealth?.healthy ?? wbStatus?.healthy ?? 0;
+      wb.total = wbHealth?.total ?? wbStatus?.total ?? 0;
+      wb.cooling = wbStatus?.cooling ?? 0;
+      wb.disabled = wbStatus?.disabled ?? 0;
+      wb.realmServable = wbHealth?.realm_servable ?? null;
+      wb.realmTotals = wbStatus?.realm_totals ?? null;
+      // 有任一账号健康即视为该分组可用
+      wb.ok = wb.healthy > 0;
+      health.workbuddy = wb;
+    }
+
+    health.ok = health.groups.antigravity.ok || health.groups.agentrouter.ok || health.groups.workbuddy.ok;
   } catch (e) {
     health.error = String(e);
   }
   return c.json(health);
 });
 
-// ---- SSE: push health + auth-files snapshot periodically ----
+// ---- SSE: one server-side poller feeds every connected client (and idles when nobody is watching) ----
+const authFilesFeed = new Broadcaster<any[]>(async () => getAuthFiles(), 5000);
+
 app.get('/api/events', async (c) => {
   return streamSSE(c, async (stream) => {
-    const push = async () => {
-      const res = await mgmt('/auth-files');
-      if (res.ok) {
-        const data: any = await res.json();
-        await stream.writeSSE({ data: JSON.stringify({ type: 'auth-files', files: data.files ?? [] }), event: 'auth-files' });
-      }
-    };
-    await push();
-    const timer = setInterval(push, 5000);
-    stream.onAbort(() => clearInterval(timer));
-    while (true) {
-      await stream.sleep(60_000);
+    const off = authFilesFeed.subscribe((files) => {
+      void stream.writeSSE({ data: JSON.stringify({ type: 'auth-files', files }), event: 'auth-files' }).catch(() => {});
+    });
+    stream.onAbort(off);
+    while (!stream.aborted) {
+      await stream.sleep(30_000);
+      // Comment-only keep-alive so idle proxies/tunnels do not cut the connection.
+      await stream.write(': ping\n\n').catch(() => {});
     }
+    off();
   });
 });
 
-app.get('/api/ping', (c) => c.json({ ok: true, proxy: PROXY_URL }));
+// ---- Record usage record endpoint (for AgentRouter & custom clients) ----
+app.post('/api/usage/record', async (c) => {
+  if (Number(c.req.header('content-length') ?? 0) > 16_384) return c.json({ error: 'payload too large' }, 413);
+  const row = parseUsageRecord(await c.req.json().catch(() => null));
+  if (!row) return c.json({ error: 'invalid payload' }, 400);
+  try {
+    // group: an explicit one from the client wins; otherwise insertUsageRows infers it from account, then model.
+    insertUsageRows(db, [row]);
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 500);
+  }
+});
 
-console.log(`[antigravity-ui server] listening on http://127.0.0.1:${PORT}`);
+// Built web UI (bun run build). Registered last so every /api route above wins; absent in dev (Vite serves the UI).
+const serveUi = createStaticHandler(new URL('../../web/dist', import.meta.url).pathname);
+if (serveUi) app.get('*', serveUi);
+
+console.log(`[antigravity-ui server] listening on http://${BIND_HOST}:${PORT}${remote.enabled ? ' (remote mode: token auth on)' : ''}`);
+if (remote.enabled && !remote.allowedHosts.length) {
+  console.warn('[antigravity-ui server] remote mode without ANTI_UI_ALLOWED_HOSTS: only loopback Host headers are accepted');
+}
 console.log(`[antigravity-ui server] proxying management API -> ${PROXY_URL}/v0/management`);
 
 // start usage queue consumer
 setInterval(consumeUsageQueue, 10_000);
 consumeUsageQueue();
 
+// Optional retention: ANTI_UI_USAGE_RETENTION_DAYS=N deletes usage rows older than N days (default: keep everything).
+const RETENTION_DAYS = Number(process.env.ANTI_UI_USAGE_RETENTION_DAYS ?? 0);
+if (RETENTION_DAYS > 0) {
+  const prune = () => {
+    const n = pruneUsage(db, RETENTION_DAYS);
+    if (n) console.log(`[usage] pruned ${n} rows older than ${RETENTION_DAYS} days`);
+  };
+  prune();
+  setInterval(prune, 6 * 3600_000);
+}
+
 export default {
   port: PORT,
-  hostname: '127.0.0.1',
+  hostname: BIND_HOST,
   fetch: app.fetch,
 };

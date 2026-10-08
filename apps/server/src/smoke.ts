@@ -17,7 +17,12 @@ function check(name: string, cond: boolean, detail = '') {
 async function j(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      // Remote mode (ANTI_UI_REMOTE=1) needs a credential even from loopback.
+      ...(process.env.ANTI_UI_ADMIN_TOKEN ? { Authorization: `Bearer ${process.env.ANTI_UI_ADMIN_TOKEN}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   const text = await res.text();
   try {
