@@ -7,8 +7,11 @@ import { priceFor } from './pricing';
 import { insertUsageRows, openUsageDb, parseUsageRecord, pruneUsage, queryTimeline, type UsageInput } from './usage-db';
 import { createAuth, loadRemoteConfig } from './auth';
 import { createStaticHandler } from './static';
-import { createAuditMiddleware, ensureAuditSchema, recentAudit } from './audit';
+import { createAuditMiddleware, ensureAuditSchema, recentAudit, recordAudit } from './audit';
 import { createCallGate } from './limits';
+import { createKey, deleteKey, listKeys, parseKeyInput, revealKey, updateKey } from './gateway/keys';
+import { loadMasterKey } from './gateway/secret';
+import { queryGatewayLogs, queryGatewayStats, requestsLast24h, type LogQuery } from './gateway/stats';
 import { Broadcaster, TtlCache, responseCache } from './shared-cache';
 import { apiSecurityHeaders, createLocalGuard, isDirectLocalRequest, isMgmtAllowed, redactSecrets } from './security';
 import {
@@ -118,6 +121,81 @@ auth.registerRoutes(app);
 app.get('/api/audit', (c) => {
   if (auth.roleOf(c) !== 'admin') return c.json({ error: 'admin role required' }, 403);
   return c.json({ remote: remote.enabled, rows: recentAudit(db, Number(c.req.query('limit') ?? 100)) });
+});
+
+// ---- Remote API gateway management (keys + access stats). The gateway itself is a separate process
+// (src/gateway/index.ts) that shares usage.sqlite; this only edits its keys and reads its log. ----
+// Encrypts the stored copy of each key so the dashboard can show it again (master key: env or a 0600 file next to the db).
+const GATEWAY_MASTER_KEY = loadMasterKey(process.env, '.gateway-secret');
+const GATEWAY_PORT = Number(process.env.ANTI_UI_GATEWAY_PORT ?? 4311);
+const GATEWAY_PUBLIC_URL = (process.env.ANTI_UI_GATEWAY_PUBLIC_URL ?? '').replace(/\/$/, '');
+
+app.get('/api/remote/info', async (c) => {
+  let gatewayUp = false;
+  try {
+    gatewayUp = (await fetch(`http://127.0.0.1:${GATEWAY_PORT}/healthz`, { signal: AbortSignal.timeout(1500) })).ok;
+  } catch {
+    /* not running */
+  }
+  return c.json({
+    publicUrl: GATEWAY_PUBLIC_URL || null,
+    localUrl: `http://127.0.0.1:${GATEWAY_PORT}`,
+    gatewayUp,
+    globalRpm: Number(process.env.ANTI_UI_GATEWAY_GLOBAL_RPM ?? 120),
+    globalConcurrency: Number(process.env.ANTI_UI_GATEWAY_GLOBAL_CONCURRENCY ?? 4),
+    retentionDays: Number(process.env.ANTI_UI_GATEWAY_RETENTION_DAYS ?? 90),
+  });
+});
+
+app.get('/api/remote/keys', (c) => {
+  const last24h = requestsLast24h(db);
+  return c.json({ keys: listKeys(db).map((k) => ({ ...k, requests24h: last24h[k.id] ?? 0 })) });
+});
+
+app.post('/api/remote/keys', async (c) => {
+  const parsed = parseKeyInput(await c.req.json().catch(() => null), { partial: false });
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const { key, record } = createKey(db, parsed.value as any, Date.now(), GATEWAY_MASTER_KEY);
+  return c.json({ key, record: { ...record, requests24h: 0 } }, 201);
+});
+
+// Shows the full key again. Admin only (a viewer must not be able to read credentials) and written to the audit log,
+// since a GET is otherwise not audited.
+app.get('/api/remote/keys/:id/secret', (c) => {
+  if (auth.roleOf(c) !== 'admin') return c.json({ error: 'admin role required' }, 403);
+  const id = c.req.param('id');
+  const key = revealKey(db, id, GATEWAY_MASTER_KEY);
+  recordAudit(db, { ts: Date.now(), role: 'admin', ip: auth.clientIp(c), ua: c.req.header('user-agent') ?? '', method: 'GET', path: `/api/remote/keys/${id.slice(0, 20)}/secret`, status: key ? 200 : 404 });
+  return key ? c.json({ key }) : c.json({ error: 'this key cannot be shown (it was created before keys were stored)' }, 404);
+});
+
+app.patch('/api/remote/keys/:id', async (c) => {
+  const parsed = parseKeyInput(await c.req.json().catch(() => null), { partial: true });
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const rec = updateKey(db, c.req.param('id'), parsed.value);
+  return rec ? c.json({ record: rec }) : c.json({ error: 'not found' }, 404);
+});
+
+app.delete('/api/remote/keys/:id', (c) => (deleteKey(db, c.req.param('id')) ? c.json({ ok: true }) : c.json({ error: 'not found' }, 404)));
+
+app.get('/api/remote/stats', (c) => {
+  const period = c.req.query('period') ?? 'today';
+  const now = Date.now();
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  const since = period === '30d' ? now - 30 * 86_400_000 : period === '7d' ? now - 7 * 86_400_000 : period === '24h' ? now - 86_400_000 : midnight.getTime();
+  return c.json(queryGatewayStats(db, since, now + 1));
+});
+
+app.get('/api/remote/logs', (c) => {
+  const q: LogQuery = { limit: Number(c.req.query('limit') ?? 100) };
+  const before = Number(c.req.query('beforeId'));
+  if (Number.isInteger(before) && before > 0) q.beforeId = before;
+  const outcome = c.req.query('outcome');
+  if (outcome === 'ok' || outcome === 'error' || outcome === 'rejected') q.outcome = outcome;
+  if (c.req.query('keyId')) q.keyId = c.req.query('keyId')!.slice(0, 40);
+  if (c.req.query('model')) q.model = c.req.query('model')!.slice(0, 100);
+  return c.json({ rows: queryGatewayLogs(db, q) });
 });
 
 // Calls that spend real upstream quota (or act with an account's OAuth token) get a circuit breaker.

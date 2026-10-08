@@ -276,3 +276,88 @@ export interface AuditEntry {
   path: string;
   status: number;
 }
+
+// ---- Remote API gateway (src/gateway) ----
+
+export interface GatewayKey {
+  id: string;
+  name: string;
+  note: string;
+  prefix: string;
+  createdMs: number;
+  expiresMs: number | null;
+  enabled: boolean;
+  /** Allowed model ids; a trailing `*` is a prefix match. null = any model. */
+  models: string[] | null;
+  rpm: number | null;
+  concurrency: number | null;
+  dailyLimit: number | null;
+  lastUsedMs: number | null;
+  lastIp: string | null;
+  /** The dashboard can show the full key again. */
+  revealable: boolean;
+  requests24h: number;
+}
+
+export interface GatewayKeyInput {
+  name: string;
+  note?: string;
+  expiresMs?: number | null;
+  models?: string[] | null;
+  rpm?: number | null;
+  concurrency?: number | null;
+  dailyLimit?: number | null;
+}
+
+export interface GatewayInfo {
+  publicUrl: string | null;
+  localUrl: string;
+  gatewayUp: boolean;
+  globalRpm: number;
+  globalConcurrency: number;
+  retentionDays: number;
+}
+
+export interface GatewayStats {
+  sinceMs: number;
+  untilMs: number;
+  total: number;
+  ok: number;
+  upstreamErrors: number;
+  rejected: number;
+  latencyP50: number | null;
+  latencyP95: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** Requests whose response reported usage, out of `forwarded` — tokens are best-effort. */
+  tokenRows: number;
+  forwarded: number;
+  activeKeys: number;
+  byKey: Array<{ keyId: string | null; requests: number; rejected: number; tokens: number; lastMs: number }>;
+  byModel: Array<{ model: string; requests: number; tokens: number }>;
+  byIp: Array<{ ip: string; country: string | null; requests: number; rejected: number; lastMs: number }>;
+  byCountry: Array<{ country: string; requests: number }>;
+  timeline: Array<{ t: number; requests: number; errors: number; tokens: number }>;
+}
+
+export interface GatewayLogRow {
+  id: number;
+  tsMs: number;
+  keyId: string | null;
+  keyName: string | null;
+  ip: string;
+  country: string | null;
+  ua: string | null;
+  method: string;
+  path: string;
+  model: string | null;
+  status: number;
+  latencyMs: number;
+  bytes: number;
+  stream: boolean;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  error: string | null;
+}

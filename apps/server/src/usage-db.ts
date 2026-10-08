@@ -1,4 +1,5 @@
 import { Database } from 'bun:sqlite';
+import { ensureGatewaySchema } from './gateway/keys';
 import { inferGroup, isProviderGroup, type ProviderGroup } from './groups';
 import { costOf, priceFor } from './pricing';
 
@@ -20,6 +21,13 @@ const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : N
 
 export function openUsageDb(path: string): Database {
   const db = new Database(path, { create: true });
+  // The dashboard and the remote gateway are separate processes sharing this file: WAL lets one write while the other reads.
+  try {
+    db.run('PRAGMA busy_timeout = 5000');
+    db.run('PRAGMA journal_mode = WAL');
+  } catch {
+    /* read-only / in-memory: keep the default journal */
+  }
   ensureSchema(db);
   return db;
 }
@@ -38,6 +46,7 @@ export function ensureSchema(db: Database) {
     failed INTEGER DEFAULT 0
   )`);
   migrate(db);
+  ensureGatewaySchema(db);
 }
 
 /**

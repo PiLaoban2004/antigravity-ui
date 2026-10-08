@@ -9,6 +9,9 @@ bun.lockb
 .env.*.local
 *.env
 
+# Gateway master key (encrypts stored API keys)
+.gateway-secret
+
 # SQLite databases & logs
 *.sqlite
 *.sqlite-journal

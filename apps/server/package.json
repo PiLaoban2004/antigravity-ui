@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
+    "gateway": "bun src/gateway/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
