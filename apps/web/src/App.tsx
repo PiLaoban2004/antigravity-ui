@@ -13,6 +13,7 @@ import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import Availability from './pages/Availability';
 import Usage from './pages/Usage';
+import Remote from './pages/Remote';
 import Quota from './pages/Quota';
 
 export default function App() {
@@ -70,6 +71,7 @@ function AppRoutes() {
         <Route path="/clients" element={<Clients />} />
         <Route path="/availability" element={<Availability />} />
         <Route path="/usage" element={<Usage />} />
+        <Route path="/remote" element={<Remote />} />
         <Route path="/quota" element={<Quota />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/settings" element={<Settings />} />

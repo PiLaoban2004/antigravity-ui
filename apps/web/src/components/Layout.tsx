@@ -12,6 +12,7 @@ import {
   Gauge,
   ChartColumn,
   CircleGauge,
+  Globe2,
   Zap,
   Coins,
   LogOut,
@@ -32,6 +33,7 @@ const nav = [
   { to: '/availability', label: '可用性与竞速测试', icon: Gauge },
   { to: '/quota', label: '额度监控', icon: CircleGauge },
   { to: '/usage', label: '模型用量', icon: ChartColumn },
+  { to: '/remote', label: '远程调用', icon: Globe2 },
   { to: '/logs', label: '日志', icon: ScrollText },
   { to: '/settings', label: '设置', icon: Settings },
 ];
