@@ -1,0 +1,67 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A local dashboard for managing [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (Google Antigravity / Gemini reverse proxy). Bun-workspaces monorepo; UI strings and many code comments are in Chinese (README.md is Chinese, README_EN.md English).
+
+- `apps/server` — Bun + Hono backend (`:4310`): routes in `src/index.ts`, logic split into testable modules (`security`, `auth`, `audit`, `limits`, `shared-cache`, `static`, `quota`, `language-server`, `usage-db`, `pricing`, `groups`); prices in `pricing.json`
+- `apps/web` — React 19 + Vite 6 + Tailwind v4 SPA (`:4321`)
+- `packages/shared` — TypeScript types only (`@antigravity-ui/shared`, consumed as raw `src/index.ts`, no build step)
+
+## Commands
+
+Bun is required (`bun:sqlite`, `Bun.spawn`, `Bun.file` are used in the server).
+
+```bash
+bun install
+cp apps/server/.env.example apps/server/.env   # set ANTI_UI_MGMT_KEY (CLIProxyAPI management secret)
+./start.sh                  # dev: server (bun --watch) + web (vite) together
+bun run dev:server          # server only
+bun run dev:web             # web only
+bun run typecheck           # tsc --noEmit in every workspace (no linter)
+bun run test                # bun:test unit tests in apps/server (src/*.test.ts)
+cd apps/server && bun test src/quota.test.ts -t "elapsed"   # single file / single test by name
+bun run build               # vite build -> apps/web/dist
+bun apps/server/src/smoke.ts   # integration smoke test; needs the server on :4310 AND a live CLIProxyAPI (export ANTI_UI_ADMIN_TOKEN if remote mode is on)
+```
+
+Unit tests cover the modules above (usage-db uses in-memory SQLite) but not the HTTP routes; `smoke.ts` is the only test of the HTTP surface and hits real endpoints (and briefly changes routing strategy / account weight, restoring them afterwards).
+
+**The server's working directory matters.** `usage.sqlite` and `quota_cache*.json` are opened with relative paths, so the server must be started from `apps/server/` (as `start.sh` and the package scripts do), otherwise it creates fresh copies elsewhere.
+
+## Architecture
+
+### Server (`apps/server/src/index.ts`)
+Everything is one Hono app; a "route" section per concern:
+
+- **Management gateway** — `mgmt()` injects `ANTI_UI_MGMT_KEY` as a Bearer token and forwards to `${ANTI_UI_PROXY_URL}/v0/management`. `ALL /api/mgmt/*` is a passthrough **restricted to an allowlist of (method, exact path)** in `src/security.ts` (`isMgmtAllowed`); anything else is 403. When the web UI needs a new CLIProxyAPI management call, add it there — and never allow `/api-call`, which makes an arbitrary HTTP request carrying an account's OAuth token (`POST /api/auth/test` does the one fixed tokeninfo check instead). `GET /config` is passed through `redactSecrets`.
+- **Local-only guard** — `createLocalGuard` (`security.ts`) runs on every `/api/*` request before CORS: it rejects a non-local `Host` (DNS rebinding) and any `Origin` / `Sec-Fetch-Site: cross-site` that is not the web UI. Requests with no `Origin` (curl, `smoke.ts`) pass. Middleware order in `index.ts` is fixed: security headers → guard → cors → audit → auth.
+- **Remote mode** (`ANTI_UI_REMOTE=1`, full guide in `docs/REMOTE.md`) — off by default, in which case nothing below applies and the API is unauthenticated loopback-only. When on: `auth.ts` requires a credential on **every** `/api` request, *including from 127.0.0.1* (a tunnel forwards from loopback, so the peer address is not a trust signal); roles are `admin` (everything) and `viewer` (GET only — any non-GET needs admin); tokens (≥24 chars, startup refuses weaker) are exchanged at `POST /api/session` for an in-memory HttpOnly/SameSite=Strict cookie, or sent as `Authorization: Bearer` by scripts; failed logins are rate limited per IP and globally; `ANTI_UI_ALLOWED_HOSTS` extends the guard's Host allowlist; `ANTI_UI_RECORD_KEY` (`X-Record-Key`) opens only `POST /api/usage/record`. Writes and login attempts go to the `audit` table (method/path/status only). `ANTI_UI_BIND_HOST` must stay loopback unless remote mode is on. In remote mode OAuth start (`/antigravity-auth-url`) is refused unless `isDirectLocalRequest` (loopback Host, no forwarding headers) — a sign-in from a new device/IP is what gets Google accounts reviewed.
+- **Google-facing traffic stays single-source.** This repo never calls Google itself (only the local `language_server` and CLIProxyAPI do). Keep it that way, and don't add features that make viewers cause extra upstream work: `/api/health` (5s), `/api/quota` (20s) and `/auth-files` (2s) go through `shared-cache.ts` (`TtlCache`, `responseCache`), SSE is one `Broadcaster` that idles when nobody listens, and a non-GET through the mgmt proxy calls `shared.invalidate()`. `/api/test/model` and `/api/auth/test` sit behind `createCallGate` (they spend real quota). No fingerprint spoofing, header rewriting, IP rotation or account rotation — deliberately out of scope.
+- **Static UI** — `static.ts` serves `apps/web/dist` (when built) from the same origin with a CSP and SPA fallback, registered after all `/api` routes; in dev Vite serves the UI instead.
+- **Three upstream "provider groups"** — `antigravity` (CLIProxyAPI :8317), `agentrouter` (:15721), `workbuddy` (workbuddy2api :7863, its own bearer key). **A usage row's group is decided where it is recorded** and stored in `usage.grp`: rows drained from CLIProxyAPI's queue are `antigravity`; `POST /api/usage/record` takes an explicit `group`, else infers from `account` then model (`groups.ts: inferGroup`). Do not classify by model name at read time — AgentRouter adds models faster than any list (`gpt-6-astra` was misfiled that way) and the same id can come from different providers. The hardcoded `AGENTROUTER_MODELS` list is only a last-resort heuristic and for the health/test endpoints. The web's `Usage.tsx` uses the server's `group` and keeps `guessModelGroup` purely as a fallback.
+- **Usage store** (`usage-db.ts`) — `bun:sqlite` table `usage`, opened with an additive migration (adds `ts_ms` epoch-ms and `grp`, backfills old rows, never rewrites `ts`). Always query/range on `ts_ms`; `ts` is free-form text. `consumeUsageQueue()` runs every 10s, draining CLIProxyAPI's `/usage-queue`; the drain is destructive, so rows go in via one transaction (`insertUsageRows`) and a failed batch is held in memory and retried with the next one. `queryTimeline` pre-aggregates in SQL into 15-minute slots and buckets by local time in JS (time-zone logic stays in one place; totals are the sum of the buckets, and `period=all` spans from the first month with data). `ANTI_UI_USAGE_RETENTION_DAYS` optionally prunes old rows (default: keep all).
+- **Pricing** — `pricing.json` (USD per 1M tokens) read through `pricing.ts: priceFor(model, group)`: per-model entry, else the group's default; WorkBuddy is always 0. Every endpoint that shows a price or cost uses it.
+- **Quota (`GET /api/quota`)** — the most intricate part. It does *not* use CLIProxyAPI for quota numbers: `language-server.ts` finds **every** running `language_server` (`ps -axo` + `lsof`; macOS/Linux, not Windows), reads each one's `--csrf_token` and `--override_ide_version`, probes its listening ports, and calls the Connect-RPC endpoints `GetUserStatus` / `RetrieveUserQuotaSummary`. Endpoints are cached (30s when found, 10s when none, so a closed IDE does not cost a ps/lsof sweep per poll) and one sweep is shared by concurrent requests. Each running server is a different signed-in account (`userStatus.email`); live data exists for the target account only if some IDE is signed in as it. For other accounts the response is a **per-account disk cache** (`quota_cache_<email>.json`, gitignored, `cacheVersion` 2, dropped after 12h) or, with no cache, state derived from CLIProxyAPI (disabled / token expired / needs verification / 429 `cooldowns`). Conventions to preserve:
+  - **`null` means unknown, never 100%.** A healthy account with no data reports `null` percentages and `promptCredits: null`; `0` is used only for states known to be unavailable. `Quota.tsx` renders `null` as `--`.
+  - Pure logic lives in `src/quota.ts`: `buildQuotaGroup` stores each window's `…ResetAt` timestamp next to the pre-formatted strings, and `freshenQuotaSnapshot` re-ages a cached snapshot on read (countdowns follow the clock; a window whose reset time has passed loses its stale percentage). Don't replay stored countdown strings.
+  - **Cooldown is an overlay, not cached data.** If CLIProxyAPI reports a 429 cooldown for the account, the live response keeps the IDE's own numbers, marks the affected pool's models exhausted, and adds `accountState: 'cooldown'` + `cooldownZh/En/EndsAt`. The overlay is applied after `saveQuotaCache`, never persisted. IDE model ids are opaque (`MODEL_PLACEHOLDER_*`), so cooldown matching there is by pool, not by id.
+  - The model list for non-live accounts comes from the gateway's `/v1/models` (hardcoded fallback only if unreachable).
+- **SSE** — `/api/events` pushes the CLIProxyAPI auth-files list every 5s from one shared server-side poller.
+
+### Web (`apps/web`)
+- Pages in `src/pages/*` are routed in `App.tsx` under a shared `components/Layout.tsx`. All HTTP goes through the typed `api` object in `src/lib/api.ts` (relative `/api`, proxied to `:4310` by Vite). Types are re-exported from `@antigravity-ui/shared` through that file.
+- `lib/events.ts` owns the single app-wide `EventSource` (relative `/api/events`, ref-counted; `useAuthFiles` and Accounts share it). Never hardcode `http://127.0.0.1:4310` in the web app — it must work through a tunnel. Polling pages use `lib/poll.ts: pollWhileVisible` so hidden tabs make no requests.
+- **Mobile layout** (the dashboard is used from a phone through the tunnel). `Layout.tsx` is a drawer sidebar + top bar below `md` and a fixed sidebar from `md`; because that sidebar takes 256px, page headers that sit side by side switch to a row at `lg`, not `md`. Rules that keep pages from overflowing at 390px: page padding is `p-4 sm:p-6 md:p-8`; tab/segment strips get `max-w-full min-w-0 overflow-x-auto` with `[&>button]:shrink-0 [&>button]:whitespace-nowrap`; wide tables sit in an `overflow-x-auto` wrapper with a `min-w-*`; header action buttons are `whitespace-nowrap`; `index.css` forces 16px form controls under 768px (iOS zooms on focus otherwise). Check with real device emulation, not a narrow window: desktop Chrome cannot be narrower than ~500px, so a `--window-size=390` screenshot is really a wider layout cropped. Use the DevTools protocol (`Emulation.setDeviceMetricsOverride`, `mobile: true`) and compare `main.scrollWidth` to `clientWidth` per page.
+- `App.tsx` asks `GET /api/session` first; in remote mode without a session it renders `pages/Login.tsx`, and any 401 (`UNAUTHORIZED_EVENT` from `api.ts`) sends the user back there. `lib/session.tsx` exposes `remote`/`role`; write controls carry a `data-write` attribute, which `index.css` greys out for the `viewer` role (cosmetic — the server enforces it).
+- Styling is Tailwind v4 (CSS-first, `@import "tailwindcss"` in `index.css`, no config file), dark theme only. Charts use Recharts.
+
+### Keeping the contract in sync
+When adding or changing an endpoint response, update the interface in `packages/shared/src/index.ts`, the method in `apps/web/src/lib/api.ts`, and the server handler together — the server returns untyped `any` objects, so `tsc` will not catch drift between them.
+
+## Config (apps/server/.env)
+`ANTI_UI_MGMT_KEY`, `ANTI_UI_PROXY_URL` (default `http://127.0.0.1:8317`), `ANTI_UI_PORT` (4310), `ANTI_UI_WEB_ORIGIN` (CORS, default `http://127.0.0.1:4321`), plus optional `ANTI_UI_AGENTROUTER_URL`, `ANTI_UI_WORKBUDDY_URL`, `ANTI_UI_WORKBUDDY_KEY`, `ANTI_UI_USAGE_RETENTION_DAYS`, and the remote-mode set (`ANTI_UI_REMOTE`, `_ADMIN_TOKEN`, `_VIEW_TOKEN`, `_ALLOWED_HOSTS`, `_WEB_ORIGINS`, `_TRUSTED_PROXY`, `_RECORD_KEY`, `_SESSION_HOURS`, `_BIND_HOST`) — all documented in `.env.example`.
+
+`*.sqlite`, `*.log`, `.env`, `dist/` and `quota_cache*.json` (contain account emails) are gitignored. Client-config templates in `Clients.tsx` must reference API keys via env-var placeholders (e.g. `${AGENTROUTER_API_KEY}`), never literal keys.

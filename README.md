@@ -213,14 +213,14 @@ Google 对免费层账号存在较严格的分钟级与日级配额限制，连�
 
 <details>
 <summary><b>Q: 如何修改模型定价换算规则？</b></summary>
-可直接在 <code>apps/server/src/index.ts</code> 中的 <code>MODEL_PRICES</code> 字典修改各模型的输入/输出价格（单位：美元 / 1M Tokens）。
+编辑 <code>apps/server/pricing.json</code>（单位：美元 / 1M Tokens）：<code>models</code> 里按模型 id 写单价，没列出的模型使用所属分组的 <code>default</code>。保存后重启服务生效。
 </details>
 
 ---
 
 ## 🔒 安全与免责声明
 
-1. **仅限本地使用**：默认绑定 `127.0.0.1`，管理密钥仅在后端内存与本地 `.env` 中使用，切勿暴露公网。
+1. **默认仅限本地使用**：默认绑定 `127.0.0.1`，管理密钥仅在后端内存与本地 `.env` 中使用，切勿暴露公网。需要从其他设备查看时，请阅读 [远程访问](./docs/REMOTE.md)（令牌鉴权 + Tailscale / Cloudflare Access 隧道 + 审计），不要直接开放端口。
 2. **免责声明**：本项目仅供个人开发、学习与学术研究使用。请严格遵守 Google 官方相关服务条款（Terms of Service），请勿用于高频爬取或商业性滥用。
 
 ---
